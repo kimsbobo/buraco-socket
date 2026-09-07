@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Brazilia — Dev Console</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b23;
+    --panel2: #1c232e;
+    --border: #2a3342;
+    --text: #e6ebf2;
+    --muted: #8b98ab;
+    --accent: #4f8cff;
+    --danger: #ff5d5d;
+    --warn: #ffb454;
+    --ok: #3dd68c;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: var(--bg); z-index: 5;
+  }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .4px; }
+  header h1 span { color: var(--accent); }
+  .spacer { flex: 1; }
+  .secret-box { display: flex; gap: 8px; align-items: center; }
+  .secret-box label { color: var(--muted); font-size: 12px; }
+  input[type=text], input[type=password] {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 10px; font-size: 13px; outline: none; min-width: 220px;
+  }
+  input:focus { border-color: var(--accent); }
+  button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 14px; font-size: 13px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+  button.warn { background: var(--warn); border-color: var(--warn); color: #20140a; }
+  button.small { padding: 4px 10px; font-size: 12px; }
+  main { display: grid; grid-template-columns: 380px 1fr; gap: 16px; padding: 16px 20px; align-items: start; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 16px;
+  }
+  .panel h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 1.2px;
+    color: var(--muted); margin: 0 0 12px;
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+  .row:last-child { margin-bottom: 0; }
+  .status-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px;
+  }
+  .stat { background: var(--panel2); border-radius: 8px; padding: 8px 10px; }
+  .stat .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .8px; }
+  .stat .v { font-size: 15px; font-family: var(--mono); margin-top: 2px; }
+  .badge {
+    display: inline-block; padding: 2px 9px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; letter-spacing: .4px;
+  }
+  .badge.on { background: rgba(255,93,93,.15); color: var(--danger); border: 1px solid rgba(255,93,93,.4); }
+  .badge.off { background: rgba(61,214,140,.12); color: var(--ok); border: 1px solid rgba(61,214,140,.35); }
+  .badge.neutral { background: var(--panel2); color: var(--muted); border: 1px solid var(--border); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .8px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 7px 8px; border-bottom: 1px solid rgba(42,51,66,.5); font-family: var(--mono); font-size: 12px; }
+  tr.room-row { cursor: pointer; }
+  tr.room-row:hover td { background: var(--panel2); }
+  tr.room-row.selected td { background: rgba(79,140,255,.12); }
+  .cards { display: flex; flex-wrap: wrap; gap: 4px; }
+  .card {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 30px; height: 24px; padding: 0 5px; border-radius: 4px;
+    background: #f5f0e6; color: #1a1a1a; font: 600 11px var(--mono);
+    border: 1px solid #cfc6b4;
+  }
+  .card.red { color: #c0392b; }
+  .card.joker { background: #2a3342; color: var(--warn); border-color: var(--warn); }
+  .player {
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; margin-bottom: 10px;
+  }
+  .player .head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .player .name { font-weight: 600; }
+  .player .pid { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+  .player .turn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); display: inline-block; }
+  .change-form { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center; }
+  .change-form input { flex: 1; min-width: 240px; }
+  .hint { color: var(--muted); font-size: 11px; font-family: var(--mono); }
+  .log {
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
+    max-height: 140px; overflow-y: auto; background: var(--panel2);
+    border-radius: 8px; padding: 8px 10px;
+  }
+  .log .ok { color: var(--ok); }
+  .log .err { color: var(--danger); }
+  .empty { color: var(--muted); padding: 18px 0; text-align: center; font-size: 13px; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 12.5px; }
+  .kv .k { color: var(--muted); }
+  .kv .v { font-family: var(--mono); }
+  a { color: var(--accent); }
+  .toast {
+    position: fixed; bottom: 18px; right: 18px; z-index: 20;
+    background: var(--panel2); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 10px 14px; font-size: 13px; max-width: 380px;
+    box-shadow: 0 6px 24px rgba(0,0,0,.4); display: none;
+  }
+  .toast.err { border-left-color: var(--danger); }
+  .toast.show { display: block; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🃏 Brazilia <span>Dev Console</span></h1>
+  <span id="env-badge" class="badge neutral">—</span>
+  <span id="maintenance-badge" class="badge neutral">maintenance: unknown</span>
+  <div class="spacer"></div>
+  <div class="secret-box">
+    <label for="secret">webhook secret</label>
+    <input type="password" id="secret" placeholder="x-webhook-secret" autocomplete="off">
+    <button class="primary" id="btn-save-secret">Connect</button>
+  </div>
+</header>
+
+<main>
+  <section>
+    <div class="panel">
+      <h2>Server</h2>
+      <div class="status-grid" id="server-stats"><div class="empty">not connected</div></div>
+    </div>
+
+    <div class="panel">
+      <h2>Ops Broadcasts</h2>
+      <div class="row">
+        <input type="text" id="ops-message" placeholder="optional player-facing message">
+      </div>
+      <div class="row">
+        <button class="danger" id="btn-maint-on">Maintenance ON</button>
+        <button id="btn-maint-off">All clear</button>
+      </div>
+      <div class="row">
+        <button class="warn" id="btn-restart-announce">Announce restart</button>
+      </div>
+      <div class="row">
+        <button class="danger" id="btn-restart-real">Restart server process</button>
+        <span class="hint">graceful SIGTERM after 3s (needs pm2/systemd to come back)</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Activity Log</h2>
+      <div class="log" id="log"></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="panel">
+      <h2>Rooms <span class="hint" id="rooms-refresh"></span></h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Room</th><th>Status</th><th>Players</th><th>Turn</th><th>Deck</th><th>Wells</th>
+          </tr>
+        </thead>
+        <tbody id="rooms-body">
+          <tr><td colspan="6" class="empty">enter the webhook secret to load rooms</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="panel" id="detail-panel" style="display:none">
+      <h2>Room Detail <span class="hint" id="detail-room-id"></span></h2>
+      <div class="kv" id="detail-info"></div>
+      <h2 style="margin-top:16px">Seats &amp; Hands</h2>
+      <div class="hint" style="margin-bottom:10px">
+        change cards: comma/space separated <b>AH 2S 10C JK</b> (rank+suit or suit+rank,
+        joker = JK) or paste a JSON array — the whole hand is REPLACED in the given order
+      </div>
+      <div id="players"></div>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  var SECRET_KEY = 'buraco_dev_secret';
+  var secret = localStorage.getItem(SECRET_KEY) || '';
+  var selectedRoomId = null;
+  var pollTimer = null;
+  var restarting = false;
+
+  var $ = function (id) { return document.getElementById(id); };
+  var secretInput = $('secret');
+
+  function toast(msg, isErr) {
+    var t = $('toast');
+    t.textContent = msg;
+    t.className = 'toast show' + (isErr ? ' err' : '');
+    clearTimeout(toast._h);
+    toast._h = setTimeout(function () { t.className = 'toast'; }, 3500);
+  }
+
+  function log(msg, isErr) {
+    var el = $('log');
+    var line = document.createElement('div');
+    line.className = isErr ? 'err' : 'ok';
+    line.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+    el.insertBefore(line, el.firstChild);
+    while (el.children.length > 80) el.removeChild(el.lastChild);
+  }
+
+  function api(path, options) {
+    var opts = Object.assign({ headers: { 'x-webhook-secret': secret } }, options || {});
+    return fetch(path, opts).then(function (res) {
+      return res.text().then(function (text) {
+        var body = null;
+        try { body = text ? JSON.parse(text) : null; } catch (e) { body = { raw: text }; }
+        if (!res.ok) {
+          var err = new Error((body && body.error) || ('HTTP ' + res.status));
+          err.status = res.status;
+          throw err;
+        }
+        return body;
+      });
+    });
+  }
+
+  // ---- card rendering -------------------------------------------------------
+
+  var SUITS = { hearts: '♥', diamonds: '♦', clubs: '♣', spades: '♠' };
+  var RED = { hearts: 1, diamonds: 1 };
+
+  function cardLabel(c) {
+    if (c.isJoker || c.rank === 'joker') return 'JK';
+    return c.rank + (SUITS[c.suit] || '?');
+  }
+
+  function cardChip(c) {
+    var red = c.isJoker || RED[c.suit];
+    var span = document.createElement('span');
+    span.className = 'card' + (c.isJoker ? ' joker' : red ? ' red' : '');
+    span.title = 'cardId ' + c.cardId;
+    span.textContent = cardLabel(c);
+    return span;
+  }
+
+  function cardsBlock(cards) {
+    var div = document.createElement('div');
+    div.className = 'cards';
+    if (!cards || !cards.length) {
+      div.className = 'hint';
+      div.textContent = '(empty hand)';
+      return div;
+    }
+    cards.forEach(function (c) { div.appendChild(cardChip(c)); });
+    return div;
+  }
+
+  // ---- shorthand parser (AH / HA / 10C / JK) --------------------------------
+
+  var RANK_RE = '(10|[AKQJakqj2-9])';
+  var SUIT_RE = '([HDCShdcs])';
+
+  function parseToken(tok) {
+    var t = tok.trim();
+    if (!t) return null;
+    if (/^(jk|joker|\*)$/i.test(t)) return { rank: 'joker' };
+    var m = t.match(new RegExp('^' + RANK_RE + SUIT_RE + '$', 'i'))
+         || t.match(new RegExp('^' + SUIT_RE + RANK_RE + '$', 'i'));
+    if (!m) return undefined; // signal: unparsable
+    var rank = m[1].toUpperCase();
+    var suit = m[2].toUpperCase();
+    var suitName = { H: 'hearts', D: 'diamonds', C: 'clubs', S: 'spades' }[suit];
+    return { suit: suitName, rank: rank };
+  }
+
+  function parseCardSpec(text) {
+    var trimmed = (text || '').trim();
+    if (!trimmed) return { error: 'empty' };
+    // Raw JSON array pass-through (from a previous result or a script).
+    if (trimmed[0] === '[') {
+      try {
+        var arr = JSON.parse(trimmed);
+        if (Array.isArray(arr) && arr.length) return { cards: arr };
+      } catch (e) { /* fall through to shorthand */ }
+    }
+    var tokens = trimmed.split(/[\s,;]+/).filter(Boolean);
+    var cards = [];
+    for (var i = 0; i < tokens.length; i++) {
+      var parsed = parseToken(tokens[i]);
+      if (parsed === undefined) return { error: 'cannot parse token "' + tokens[i] + '"' };
+      if (parsed) cards.push(parsed);
+    }
+    if (!cards.length) return { error: 'no cards' };
+    return { cards: cards };
+  }
+
+  // ---- server status / rooms ------------------------------------------------
+
+  function renderStatus(body) {
+    var badge = $('maintenance-badge');
+    var dev = body.development;
+    if (dev && dev.maintenance_mode) {
+      badge.textContent = 'maintenance: ON';
+      badge.className = 'badge on';
+    } else if (dev && dev.restart_server) {
+      badge.textContent = 'restart: announced ' + (dev.at || '');
+      badge.className = 'badge on';
+    } else {
+      badge.textContent = 'maintenance: OFF';
+      badge.className = 'badge off';
+    }
+    $('env-badge').textContent = String(body.environment || '?');
+    $('env-badge').className = 'badge neutral';
+    if (body.shuttingDown) {
+      $('env-badge').textContent += ' · shutting down';
+      $('env-badge').className = 'badge on';
+    }
+
+    var stats = body.stats || {};
+    var fields = [
+      ['node', body.nodeId],
+      ['pid', body.pid],
+      ['uptime', Math.floor((body.uptimeSeconds || 0) / 60) + 'm'],
+      ['rooms', (stats.totalRooms || 0) + ' (' + (stats.activeRooms || 0) + ' live)'],
+      ['players', stats.totalPlayers || 0],
+      ['sockets', stats.activeSockets || 0],
+    ];
+    var grid = $('server-stats');
+    grid.innerHTML = '';
+    fields.forEach(function (f) {
+      var d = document.createElement('div');
+      d.className = 'stat';
+      d.innerHTML = '<div class="k"></div><div class="v"></div>';
+      d.querySelector('.k').textContent = f[0];
+      d.querySelector('.v').textContent = f[1];
+      grid.appendChild(d);
+    });
+  }
+
+  function renderRooms(body) {
+    var tbody = $('rooms-body');
+    tbody.innerHTML = '';
+    var rooms = (body && body.rooms) || [];
+    if (!rooms.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">no active rooms</td></tr>';
+      return;
+    }
+    rooms.forEach(function (r) {
+      var tr = document.createElement('tr');
+      tr.className = 'room-row' + (r.roomId === selectedRoomId ? ' selected' : '');
+      var wells = (r.deadPileCounts || []).join('/');
+      var cells = [
+        (r.name || r.roomId),
+        String(r.status || '') + (r.awaitingNextRound ? ' (next round)' : ''),
+        r.playerCount + '/' + r.maxPlayers + ' (' + r.humanCount + 'h ' + r.botCount + 'b)',
+        r.cardsDealt ? ('seat ' + r.currentTurn) : '—',
+        r.deckCount == null ? '—' : String(r.deckCount),
+        wells || '—',
+      ];
+      cells.forEach(function (c) {
+        var td = document.createElement('td');
+        td.textContent = c;
+        tr.appendChild(td);
+      });
+      tr.onclick = function () {
+        selectedRoomId = r.roomId;
+        $('detail-panel').style.display = '';
+        renderRooms(body); // repaint selection
+        loadDetail();
+      };
+      tbody.appendChild(tr);
+    });
+  }
+
+  function loadDetail() {
+    if (!selectedRoomId) return;
+    api('/dev/api/rooms/' + encodeURIComponent(selectedRoomId)).then(function (d) {
+      if (!d.success) return;
+      $('detail-room-id').textContent = d.roomId;
+      var info = $('detail-info');
+      info.innerHTML = '';
+      var fields = [
+        ['status', d.status],
+        ['ruleset', d.ruleset],
+        ['in progress', d.inProgress],
+        ['cards dealt', d.cardsDealt],
+        ['current turn', d.players && d.currentTurn != null && d.players[d.currentTurn]
+          ? ('seat ' + d.currentTurn + ' · ' + d.players[d.currentTurn].playerName)
+          : (d.currentTurn != null ? 'seat ' + d.currentTurn : '—')],
+        ['turn timer', d.turnTimeLimit ? (d.turnTimeRemaining + 's / ' + d.turnTimeLimit + 's') : 'off'],
+        ['deck', d.deckCount],
+        ['wells', (d.deadPileCounts || []).join('/') + (d.wellsTakenThisRound ? ' (' + d.wellsTakenThisRound + ' taken)' : '')],
+        ['discard top', d.discardPile && d.discardPile.length
+          ? cardLabel(d.discardPile[d.discardPile.length - 1]) + ' (' + d.discardPile.length + ' cards)'
+          : 'empty'],
+        ['team scores', Object.keys(d.teamScores || {}).length
+          ? Object.keys(d.teamScores).map(function (k) { return k + '=' + d.teamScores[k]; }).join('  ')
+          : '—'],
+      ];
+      fields.forEach(function (f) {
+        var k = document.createElement('div'); k.className = 'k'; k.textContent = f[0];
+        var v = document.createElement('div'); v.className = 'v'; v.textContent = String(f[1]);
+        info.appendChild(k); info.appendChild(v);
+      });
+
+      var wrap = $('players');
+      wrap.innerHTML = '';
+      (d.players || []).forEach(function (p) {
+        wrap.appendChild(playerBlock(p, d));
+      });
+    }).catch(function (e) {
+      log('detail ' + selectedRoomId + ': ' + e.message, true);
+    });
+  }
+
+  function playerBlock(p, room) {
+    var div = document.createElement('div');
+    div.className = 'player';
+
+    var head = document.createElement('div');
+    head.className = 'head';
+    if (room.currentTurn === p.playerIndex && room.inProgress) {
+      var dot = document.createElement('span'); dot.className = 'turn-dot'; dot.title = 'current turn';
+      head.appendChild(dot);
+    }
+    var name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = '#' + p.playerIndex + '  ' + p.playerName + (p.isBot ? ' 🤖' : '');
+    var pid = document.createElement('span');
+    pid.className = 'pid';
+    pid.textContent = p.playerId + (p.isConnected ? '' : ' · disconnected');
+    var count = document.createElement('span');
+    count.className = 'hint';
+    count.textContent = p.hand.length + ' cards · ' + p.meldGroups + ' melds';
+    head.appendChild(name); head.appendChild(pid); head.appendChild(count);
+    div.appendChild(head);
+
+    div.appendChild(cardsBlock(p.hand));
+
+    var form = document.createElement('div');
+    form.className = 'change-form';
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'e.g. AH AH 2H 3H 4H JK';
+    var btn = document.createElement('button');
+    btn.className = 'small primary';
+    btn.textContent = 'Replace hand';
+    btn.onclick = function () {
+      var parsed = parseCardSpec(input.value);
+      if (parsed.error) { toast('Card spec: ' + parsed.error, true); return; }
+      var payload = {
+        roomId: selectedRoomId,
+        target_user: p.playerId,
+        change_cards: parsed.cards,
+      };
+      api('/webhooks/dev-change-cards', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-webhook-secret': secret },
+        body: JSON.stringify(payload),
+      }).then(function (result) {
+        if (!result.success) {
+          toast('Rejected: ' + result.error, true);
+          log('change_cards ' + p.playerName + ': ' + result.error, true);
+        } else {
+          toast('Hand of ' + p.playerName + ' replaced (' + result.hand.length + ' cards).');
+          log('change_cards ' + p.playerName + ' ← ' +
+            result.hand.map(cardLabel).join(' '));
+        }
+        loadDetail();
+      }).catch(function (e) {
+        toast('Change failed: ' + e.message, true);
+        log('change_cards ' + p.playerName + ': ' + e.message, true);
+      });
+    };
+    form.appendChild(input); form.appendChild(btn);
+    div.appendChild(form);
+    return div;
+  }
+
+  // ---- polling --------------------------------------------------------------
+
+  function poll() {
+    if (!secret || restarting) return;
+    api('/dev/api/status').then(renderStatus).catch(function (e) {
+      if (e.status === 401) { toast('Wrong webhook secret', true); stopPolling(); }
+    });
+    api('/dev/api/rooms').then(function (body) {
+      renderRooms(body);
+      $('rooms-refresh').textContent = '· auto-refresh 2s · ' + new Date().toLocaleTimeString();
+      if (selectedRoomId) {
+        var still = body.rooms.some(function (r) { return r.roomId === selectedRoomId; });
+        if (!still) { selectedRoomId = null; $('detail-panel').style.display = 'none'; }
+      }
+      if (selectedRoomId) loadDetail();
+    }).catch(function (e) {
+      if (e.status === 401) { stopPolling(); }
+      log('rooms: ' + e.message, true);
+    });
+  }
+
+  function startPolling() {
+    stopPolling();
+    poll();
+    pollTimer = setInterval(poll, 2000);
+  }
+
+  function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  // ---- ops actions ----------------------------------------------------------
+
+  function opsMessage() {
+    var m = $('ops-message').value.trim();
+    return m ? { message: m } : {};
+  }
+
+  function broadcast(payload, label) {
+    return api('/webhooks/development', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': secret },
+      body: JSON.stringify(payload),
+    }).then(function (result) {
+      if (!result.success) {
+        toast(label + ': ' + result.error, true);
+        log(label + ' rejected: ' + result.error, true);
+      } else {
+        toast(label + ' broadcast sent.');
+        log(label + ' → ' + JSON.stringify(payload));
+      }
+      poll();
+    }).catch(function (e) {
+      toast(label + ' failed: ' + e.message, true);
+      log(label + ': ' + e.message, true);
+    });
+  }
+
+  $('btn-maint-on').onclick = function () {
+    broadcast(Object.assign({ maintenance_mode: true }, opsMessage()), 'Maintenance ON');
+  };
+  $('btn-maint-off').onclick = function () {
+    broadcast({ maintenance_mode: false, restart_server: false }, 'All clear');
+  };
+  $('btn-restart-announce').onclick = function () {
+    broadcast(Object.assign({ restart_server: true }, opsMessage()), 'Restart announce');
+  };
+  $('btn-restart-real').onclick = function () {
+    if (!confirm('Broadcast a restart notice and shut the server process down?\n' +
+        'It comes back only if a supervisor (pm2/systemd/docker) is running it.')) return;
+    restarting = true;
+    api('/webhooks/dev-restart', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': secret },
+      body: JSON.stringify(Object.assign({ shutdown_after_ms: 3000 }, opsMessage())),
+    }).then(function (result) {
+      if (!result.success) {
+        restarting = false;
+        toast('Restart rejected: ' + result.error, true);
+        return;
+      }
+      log('dev-restart: notice sent, process exits in ' + result.shutdownInMs + 'ms');
+      toast('Restarting — server goes down in ' + (result.shutdownInMs / 1000) + 's.');
+      document.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+      setTimeout(function () { window.location.reload(); }, 12000);
+    }).catch(function (e) {
+      restarting = false;
+      toast('Restart failed: ' + e.message, true);
+      log('dev-restart: ' + e.message, true);
+    });
+  };
+
+  // ---- connect --------------------------------------------------------------
+
+  secretInput.value = secret;
+  $('btn-save-secret').onclick = function () {
+    secret = secretInput.value.trim();
+    localStorage.setItem(SECRET_KEY, secret);
+    if (secret) { startPolling(); toast('Connected — polling rooms.'); }
+    else { stopPolling(); toast('Secret cleared.'); }
+  };
+  secretInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') $('btn-save-secret').click();
+  });
+
+  if (secret) startPolling();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,53 @@
+{
+  "name": "brazilia-game-server",
+  "version": "1.0.0",
+  "description": "Professional Socket.IO server for Brazilia multiplayer game with best practices",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "dev:debug": "nodemon --inspect src/index.js",
+    "bot": "node bot/run-bot.js",
+    "bot:simulate": "node bot/simulate-plans.js",
+    "bot:play": "node bot/play-until-end.js",
+    "bot:load-soak": "node bot/load-soak.js",
+    "bot:token": "node bot/get-token.js",
+    "bot:2": "node bot/run-bot.js --name Bot-1 & node bot/run-bot.js --name Bot-2",
+    "test": "NODE_ENV=test mocha \"test/**/*.test.js\" --timeout 5000 --exit",
+    "test:watch": "NODE_ENV=test mocha \"test/**/*.test.js\" --timeout 5000 --watch",
+    "test:coverage": "NODE_ENV=test nyc mocha \"test/**/*.test.js\" --timeout 5000",
+    "test:client": "node test_client.js",
+    "lint": "eslint src/**/*.js",
+    "format": "prettier --write src/**/*.js"
+  },
+  "keywords": [
+    "brazilia",
+    "card-game",
+    "multiplayer",
+    "socket.io",
+    "game-server",
+    "real-time",
+    "websocket"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0",
+    "npm": ">=6.0.0"
+  },
+  "dependencies": {
+    "@socket.io/redis-adapter": "^8.3.0",
+    "dotenv": "^16.0.3",
+    "ioredis": "^5.11.0",
+    "socket.io": "^4.6.0"
+  },
+  "devDependencies": {
+    "chai": "^4.3.0",
+    "eslint": "^8.0.0",
+    "mocha": "^10.0.0",
+    "nodemon": "^3.0.0",
+    "nyc": "^15.1.0",
+    "prettier": "^3.0.0",
+    "socket.io-client": "^4.8.3"
+  }
+}

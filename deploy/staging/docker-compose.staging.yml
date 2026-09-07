@@ -1,0 +1,69 @@
+# Multi-node soak staging cluster (PTW-95 / scaling-plan Phase 6, runbook §3-4).
+#
+# Topology: HA-Redis stand-in + 2 socket nodes (REDIS_ADAPTER_ENABLED=true,
+# distinct NODE_ID, shared Redis) behind a sticky nginx LB (runbook §2).
+#
+# WHAT THIS PROVES: the multi-node *topology* boots and the soak driver runs
+# end-to-end against it (cross-node fan-out + owner-lease forwarding + sticky LB
+# + chaos reconnect). It is the correctness/deploy rehearsal — NOT the capacity
+# number. The 20k-socket capacity gate (scaling_plan Phase 0 AGREED TIER) must be
+# run on real distributed hardware with managed HA Redis; see README.md §"Cloud".
+#
+# Bring up:   WEBHOOK_SECRET=... docker compose -f docker-compose.staging.yml up --build -d
+# Soak:       see run-soak.sh  (or README.md §"Run the soak")
+# Tear down:  docker compose -f docker-compose.staging.yml down -v
+version: "3.8"
+
+services:
+  redis:
+    # Single Redis here is a stand-in. REAL staging MUST use managed HA Redis
+    # (Sentinel/cluster) shared by the adapter AND the owner-lease registry.
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  node-a:
+    build:
+      context: ../..
+      dockerfile: deploy/staging/Dockerfile
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      NODE_ID: soak-node-a
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_ADAPTER_ENABLED: "true"
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?set WEBHOOK_SECRET}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  node-b:
+    build:
+      context: ../..
+      dockerfile: deploy/staging/Dockerfile
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      NODE_ID: soak-node-b
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_ADAPTER_ENABLED: "true"
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?set WEBHOOK_SECRET}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  lb:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.staging.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8080:8080" # sticky LB; soak driver points --socket-urls here for prod-like routing
+    depends_on:
+      - node-a
+      - node-b
