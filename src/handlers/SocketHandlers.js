@@ -26,13 +26,14 @@ const SPECTATOR_FALLBACK_NAME = 'Spectator';
 const SPECTATOR_NAME_MAX = 32;
 
 class SocketHandlers {
-  // Upper bound for waiting on a client's DEAL_ANIMATION_COMPLETE before starting
-  // the first turn timer anyway. Comfortably longer than the client deal animation
-  // (~7s for a full two-hand deal) so it only acts as a safety net for a
-  // slow/old/disconnected client, never as the normal path.
+  // Upper bound for waiting on the clients' DEAL_ANIMATION_COMPLETE before
+  // starting the first turn timer anyway. Comfortably longer than the client's
+  // REFERENCE opening sequence (the 1v1 deal ~8s + setup ~1s + the first-turn
+  // "undian" ~3.7s ≈ 13s; a client on the "fast" setting runs the same
+  // sequence in ~7s) so it only acts as a safety net for a slow/old/backgrounded
+  // client, never as the normal path. The normal path is every seated,
+  // connected human reporting in — see _startFirstTurnTimerIfDealAcked.
   static get DEAL_ANIMATION_FALLBACK_MS() {
-    // Comfortably longer than the slowest client opening sequence: the 2v2 deal
-    // (~7s) PLUS the first-turn "undian" reveal (~5s). Acts only as a safety net.
     return 18000;
   }
 
@@ -136,6 +137,9 @@ class SocketHandlers {
     this.matchmakingQueue = matchmakingQueue;
     this.failureManager = failureManager;
     this.roomSpectators = new Map();
+    // Admin-wide skin override: { skins, expiresAt, setBy, setAt } or null.
+    this.globalSkinOverride = null;
+    this._globalSkinOverrideTimer = null;
     this.partnerWebhookRelay = partnerWebhookRelay;
     this.spectatorSocketToRoom = new Map();
     this.botCoordinator = null;
@@ -971,7 +975,7 @@ class SocketHandlers {
         turnTimeLimitSeconds: room.turnTimeLimit,
         timestamp: new Date().toISOString(),
         cardsDealt: room.cardsDealt || false,
-        skins: room.skins || {},
+        ...this._skinsPayloadFields(room),
         isSpectator: true,
         spectatorId,
         spectatorName,
@@ -1024,7 +1028,7 @@ class SocketHandlers {
       // history to derive them from, so without this the badges and the brazilia
       // markers are simply absent from their board.
       melds: room.serializeMelds(),
-      skins: room.skins || {},
+      ...this._skinsPayloadFields(room),
       timestamp: new Date().toISOString(),
       cardsDealt: room.cardsDealt || false,
       hostId: room.hostPlayerId || null,
@@ -1820,6 +1824,8 @@ class SocketHandlers {
       // Set this before broadcasting state. The state sender has a timer watchdog,
       // and it must not start the turn clock while clients are still animating deal.
       room.awaitingDealAnimation = true;
+      // Fresh deal, fresh roll-call: which seats have finished animating it.
+      room.dealAnimationAcks = new Set();
       if (room.dealAnimationFallbackHandle) clearTimeout(room.dealAnimationFallbackHandle);
       room.dealAnimationFallbackHandle = setTimeout(() => {
         room.dealAnimationFallbackHandle = null;
@@ -1845,9 +1851,19 @@ class SocketHandlers {
   }
 
   /**
-   * A client finished playing its initial deal animation. Start the first turn's
-   * timer the first time this (or the fallback) fires, so the visible countdown
-   * begins after the deal rather than behind it.
+   * A client finished playing its initial deal animation.
+   *
+   * The first turn's timer starts once EVERY seated, connected human has said
+   * so (or DEAL_ANIMATION_FALLBACK_MS gives up waiting), so the visible
+   * countdown begins after the deal rather than behind it — on every device,
+   * not just the quickest one. Clients run the ceremony at their own animation
+   * SPEED setting (the SDK's "fast" is roughly half the reference length), so
+   * "first report wins" would start a slower client's clock while its own deal
+   * was still on screen.
+   *
+   * A spectator's report never stands in for a seat's. The owner controller of
+   * a board-watch room is the one exception: its shared display IS the table
+   * every seat is looking at, so its report stands for all of them.
    * @param {Socket} socket
    */
   handleDealAnimationComplete(socket, data = {}) {
@@ -1862,21 +1878,77 @@ class SocketHandlers {
       (playerId ? this.gameService.getPlayerRoom(playerId) || this.gameService.getRoom(roomId) : null) ||
       controlledRoom ||
       this.gameService.getRoom(this.spectatorSocketToRoom.get(socket.id));
-    if (!room) return;
-    this._startFirstTurnTimerAfterDeal(
-      room,
-      playerId
-        ? `player ${playerId}`
-        : controlledRoom
-          ? `owner controller ${room.ownerControllerPlayerId || socket.id}`
-          : `spectator ${socket.id}`
-    );
+    if (!room || !room.awaitingDealAnimation) return;
+
+    const seat = playerId && typeof room.getPlayer === 'function' ? room.getPlayer(playerId) : null;
+    if (seat) {
+      if (!(room.dealAnimationAcks instanceof Set)) room.dealAnimationAcks = new Set();
+      room.dealAnimationAcks.add(String(seat.playerId));
+      this._startFirstTurnTimerIfDealAcked(room, `player ${playerId}`, { explicitAck: true });
+      return;
+    }
+    if (controlledRoom && controlledRoom === room) {
+      this._startFirstTurnTimerAfterDeal(
+        room,
+        `owner controller ${room.ownerControllerPlayerId || socket.id}`
+      );
+      return;
+    }
+    this._startFirstTurnTimerIfDealAcked(room, `spectator ${socket.id}`, { explicitAck: true });
+  }
+
+  /**
+   * Seated HUMAN players whose client has not yet reported
+   * `deal_animation_complete` for the current deal and could still do so. A bot
+   * never reports and an offline seat cannot, so neither holds the first turn.
+   * @param {import('../models/GameRoom')} room
+   * @returns {import('../models/PlayerSession')[]}
+   */
+  _dealAnimationPendingSeats(room) {
+    const acks = room.dealAnimationAcks instanceof Set ? room.dealAnimationAcks : new Set();
+    const players = typeof room.getPlayers === 'function' ? room.getPlayers() : [];
+    return players.filter((p) => !p.isBot && p.isConnected !== false && !acks.has(String(p.playerId)));
+  }
+
+  /**
+   * Start the first-turn timer once nobody is left to wait for. Called on every
+   * deal-animation report and whenever a seat drops mid-deal (a seat that is
+   * gone cannot report, and the others should not wait out the fallback for
+   * it).
+   *
+   * Without an explicit report (`explicitAck` false — the disconnect sweep)
+   * this only acts if SOMEONE reported: a table nobody finished the deal on is
+   * left to the fallback, exactly as before.
+   * @param {import('../models/GameRoom')} room
+   * @param {string} reason
+   * @param {{explicitAck?: boolean}} [options]
+   * @returns {boolean} whether this call started the timer
+   */
+  _startFirstTurnTimerIfDealAcked(room, reason, { explicitAck = false } = {}) {
+    if (!room || !room.awaitingDealAnimation) return false;
+    const pending = this._dealAnimationPendingSeats(room);
+    if (pending.length > 0) {
+      logger.info(
+        `[DEAL_CARDS] Deal animation report (${reason}) in room ${room.roomId}; still waiting on ${pending
+          .map((p) => p.playerId)
+          .join(', ')}`
+      );
+      return false;
+    }
+    const ackCount = room.dealAnimationAcks instanceof Set ? room.dealAnimationAcks.size : 0;
+    if (!explicitAck && ackCount === 0) return false;
+    this._startFirstTurnTimerAfterDeal(room, reason);
+    return true;
   }
 
   /**
    * Start the first turn timer exactly once after dealing. Guarded by
-   * room.awaitingDealAnimation so the earliest of {any client's animation-complete,
-   * the fallback timeout} wins and later ones are ignored.
+   * room.awaitingDealAnimation so the earliest of {the last seat's
+   * animation-complete (see _startFirstTurnTimerIfDealAcked), the owner
+   * controller's report, the fallback timeout} wins and later ones are ignored.
+   * Any real turn start (_stopTurnTimer) also drops the gate, so a seat that
+   * acts before its slower opponent has finished animating cannot have its
+   * clock restarted by a late report.
    * @param {import('../models/GameRoom')} room
    * @param {string} reason
    */
@@ -2737,7 +2809,7 @@ class SocketHandlers {
               players: room.getPlayers().map((mp) => this._serializePlayer(mp)),
               yourPlayerIndex: p.playerIndex,
               currentPlayerIndex: this._announcedTurnIndex(room),
-              skins: room.skins || {},
+              ...this._skinsPayloadFields(room),
               cardsDealt: room.cardsDealt || false,
               hostId: room.hostPlayerId || null,
               turnTimeLimitSeconds: room.turnTimeLimit,
@@ -2866,7 +2938,7 @@ class SocketHandlers {
               players: room.getPlayers().map((mp) => this._serializePlayer(mp)),
               yourPlayerIndex: p.playerIndex,
               currentPlayerIndex: this._announcedTurnIndex(room),
-              skins: room.skins || {},
+              ...this._skinsPayloadFields(room),
               cardsDealt: room.cardsDealt || false,
               hostId: room.hostPlayerId || null,
               turnTimeLimitSeconds: room.turnTimeLimit,
@@ -3129,6 +3201,308 @@ class SocketHandlers {
    * @param {import('../models/GameRoom')} room
    * @param {ReturnType<SocketHandlers['_roomSettingsSnapshot']>} before
    */
+  // ─── Admin skin override ──────────────────────────────────────────────────
+  // The server decides which skins a table shows (see SocketEvents.SKINS_UPDATED).
+  // Precedence: per-game override → global override (timed) → room owner skins
+  // → none. A per-game override lives on the room object, so it ends with the
+  // game (a new room starts from the players' own skins again); the global one
+  // carries an expiry and is persisted so a restart neither loses nor revives
+  // it past its deadline.
+
+  /** Skins keys an override may carry; anything else is dropped. */
+  static get SKIN_OVERRIDE_KEYS() {
+    return ['table_skin', 'card_skin', 'table_theme', 'card_back_style', 'card_face_style'];
+  }
+
+  /** Normalises an admin skins object to the allowed keys (non-empty strings only). */
+  _sanitizeOverrideSkins(input) {
+    const out = {};
+    if (!input || typeof input !== 'object') return out;
+    for (const key of SocketHandlers.SKIN_OVERRIDE_KEYS) {
+      const value = input[key];
+      if (typeof value === 'string' && value.trim().length > 0 && value.length <= 1024) {
+        out[key] = value.trim();
+      }
+    }
+    return out;
+  }
+
+  /** The active global override, dropping it (lazily) once it has expired. */
+  _activeGlobalSkinOverride() {
+    const g = this.globalSkinOverride;
+    if (!g) return null;
+    if (g.expiresAt && Date.parse(g.expiresAt) <= Date.now()) {
+      this._expireGlobalSkinOverride();
+      return null;
+    }
+    return g;
+  }
+
+  /**
+   * The skins a room shows right now and where they come from.
+   * @returns {{skins: Object, source: string, expiresAt: (string|null)}}
+   */
+  _effectiveSkins(room) {
+    // An override is composed OVER the owner's skins: the admin changes only
+    // the slots they set (a table-only override leaves the owner's card back
+    // in place) — no slot the admin never touched should visibly change.
+    const owner = room?.skins && typeof room.skins === 'object' ? room.skins : {};
+    if (room?.skinOverride?.skins && Object.keys(room.skinOverride.skins).length > 0) {
+      return { skins: { ...owner, ...room.skinOverride.skins }, source: 'admin_room', expiresAt: null };
+    }
+    const global = this._activeGlobalSkinOverride();
+    if (global && Object.keys(global.skins || {}).length > 0) {
+      return { skins: { ...owner, ...global.skins }, source: 'admin_global', expiresAt: global.expiresAt || null };
+    }
+    if (room?.skins && typeof room.skins === 'object' && Object.keys(room.skins).length > 0) {
+      return { skins: { ...room.skins }, source: 'owner', expiresAt: null };
+    }
+    return { skins: {}, source: 'none', expiresAt: null };
+  }
+
+  /** The three skin fields every state payload carries. */
+  _skinsPayloadFields(room) {
+    const eff = this._effectiveSkins(room);
+    return { skins: eff.skins, skinsSource: eff.source, skinsExpiresAt: eff.expiresAt };
+  }
+
+  /** Emits SKINS_UPDATED for `room` to its players and its spectators. */
+  _broadcastSkinsUpdated(room, reason = 'changed') {
+    if (!room) return;
+    const payload = {
+      roomId: room.roomId,
+      ...this._skinsPayloadFields(room),
+      reason,
+      timestamp: new Date().toISOString(),
+    };
+    this.io.to(room.roomId).emit(SocketEvents.SKINS_UPDATED, payload);
+    // Spectators that never joined the io room (older join paths) get their own
+    // copy; ones that did are skipped so nobody receives it twice.
+    const specs = this.roomSpectators.get(room.roomId);
+    if (specs) {
+      const members = this.io.sockets?.adapter?.rooms?.get?.(room.roomId);
+      for (const socketId of specs.keys()) {
+        if (members && members.has(socketId)) continue;
+        const socket = this.io.sockets?.sockets?.get?.(socketId);
+        if (socket) socket.emit(SocketEvents.SKINS_UPDATED, payload);
+      }
+    }
+    this._logRoomLifecycle('skins_updated', {
+      source: 'admin',
+      roomId: room.roomId,
+      skinsSource: payload.skinsSource,
+      reason,
+    });
+  }
+
+  /** Every room the server knows, for admin fan-out and listings. */
+  _allRooms() {
+    const rooms = this.gameService?.rooms;
+    if (rooms instanceof Map) return Array.from(rooms.values());
+    if (typeof this.gameService?.getAllRooms === 'function') return this.gameService.getAllRooms();
+    return [];
+  }
+
+  /**
+   * Sets an override.
+   * - `{ scope: 'room', roomId, skins, setBy? }` — this game only.
+   * - `{ scope: 'global', skins, durationMs? | expiresAt?, setBy? }` — every
+   *   room, until the deadline (no deadline = until cleared).
+   * Broadcasts to every affected room immediately, in-progress games included.
+   */
+  async setSkinOverride(data = {}) {
+    const scope = data.scope === 'global' ? 'global' : data.scope === 'room' ? 'room' : null;
+    if (!scope) return { success: false, error: "scope must be 'room' or 'global'" };
+    const skins = this._sanitizeOverrideSkins(data.skins);
+    if (Object.keys(skins).length === 0) {
+      return {
+        success: false,
+        error: `skins must carry at least one of ${SocketHandlers.SKIN_OVERRIDE_KEYS.join(', ')}`,
+      };
+    }
+    const setBy = typeof data.setBy === 'string' ? data.setBy.slice(0, 120) : null;
+    const setAt = new Date().toISOString();
+
+    if (scope === 'room') {
+      const roomId = data.roomId === null || data.roomId === undefined ? '' : String(data.roomId);
+      if (!roomId) return { success: false, error: 'roomId required' };
+      const room = this.gameService.getRoom(roomId);
+      if (!room) return { success: false, error: 'room not found' };
+      room.skinOverride = { skins, setBy, setAt };
+      this._broadcastSkinsUpdated(room, 'admin_room_set');
+      await this._persistRoomQuietly(room);
+      return { success: true, scope, roomId, skins, expiresAt: null };
+    }
+
+    let expiresAt = null;
+    if (Number.isFinite(Number(data.durationMs)) && Number(data.durationMs) > 0) {
+      expiresAt = new Date(Date.now() + Number(data.durationMs)).toISOString();
+    } else if (typeof data.expiresAt === 'string' && Number.isFinite(Date.parse(data.expiresAt))) {
+      if (Date.parse(data.expiresAt) <= Date.now()) {
+        return { success: false, error: 'expiresAt is in the past' };
+      }
+      expiresAt = new Date(Date.parse(data.expiresAt)).toISOString();
+    }
+    this.globalSkinOverride = { skins, expiresAt, setBy, setAt };
+    this._armGlobalSkinOverrideTimer();
+    await this._persistGlobalSkinOverride();
+    for (const room of this._allRooms()) this._broadcastSkinsUpdated(room, 'admin_global_set');
+    return { success: true, scope, skins, expiresAt };
+  }
+
+  /**
+   * Clears an override: `{ scope: 'room', roomId }` or `{ scope: 'global' }`.
+   * Affected rooms fall back to the next source and are told at once.
+   */
+  async clearSkinOverride(data = {}) {
+    const scope = data.scope === 'global' ? 'global' : data.scope === 'room' ? 'room' : null;
+    if (!scope) return { success: false, error: "scope must be 'room' or 'global'" };
+    if (scope === 'room') {
+      const roomId = data.roomId === null || data.roomId === undefined ? '' : String(data.roomId);
+      if (!roomId) return { success: false, error: 'roomId required' };
+      const room = this.gameService.getRoom(roomId);
+      if (!room) return { success: false, error: 'room not found' };
+      const had = Boolean(room.skinOverride);
+      room.skinOverride = null;
+      if (had) {
+        this._broadcastSkinsUpdated(room, 'admin_room_cleared');
+        await this._persistRoomQuietly(room);
+      }
+      return { success: true, scope, roomId, cleared: had };
+    }
+    const had = Boolean(this.globalSkinOverride);
+    this.globalSkinOverride = null;
+    this._armGlobalSkinOverrideTimer();
+    await this._persistGlobalSkinOverride();
+    if (had) {
+      for (const room of this._allRooms()) this._broadcastSkinsUpdated(room, 'admin_global_cleared');
+    }
+    return { success: true, scope, cleared: had };
+  }
+
+  /** The global override plus every room-level one, for the admin console. */
+  getSkinOverrideStatus() {
+    const global = this._activeGlobalSkinOverride();
+    const rooms = [];
+    for (const room of this._allRooms()) {
+      if (room.skinOverride) {
+        rooms.push({ roomId: room.roomId, status: room.status, ...room.skinOverride });
+      }
+    }
+    return { success: true, global: global ? { ...global } : null, rooms };
+  }
+
+  /** Live rooms as the admin console lists them: seats, watchers, skins in force. */
+  listRoomsForAdmin() {
+    const rooms = this._allRooms().map((room) => {
+      const players = room.getPlayers().map((p) => ({
+        playerId: String(p.playerId),
+        playerName: p.playerName ?? p.name ?? null,
+        playerIndex: p.playerIndex,
+        isBot: p.isBot === true,
+        isConnected: p.isConnected !== false,
+        avatarUrl: p.avatarUrl || p.photoUrl || null,
+      }));
+      const eff = this._effectiveSkins(room);
+      return {
+        roomId: room.roomId,
+        name: room.name ?? null,
+        status: room.status,
+        maxPlayers: room.maxPlayers,
+        playerCount: players.length,
+        spectatorCount: this.roomSpectators.get(room.roomId)?.size ?? 0,
+        hostPlayerId: room.hostPlayerId || null,
+        bet: room.bet ?? 0,
+        ruleset: room.ruleset ?? null,
+        backendUrl: room.backendBaseUrl || null,
+        players,
+        skins: eff.skins,
+        skinsSource: eff.source,
+        skinsExpiresAt: eff.expiresAt,
+        skinOverride: room.skinOverride ? { ...room.skinOverride } : null,
+        createdAt: room.createdAt?.toISOString?.() || null,
+        gameStartedAt: room.gameStartedAt?.toISOString?.() || null,
+      };
+    });
+    return { success: true, rooms, global: this._activeGlobalSkinOverride() };
+  }
+
+  /** (Re)arms the timer that clears the global override at its deadline. */
+  _armGlobalSkinOverrideTimer() {
+    if (this._globalSkinOverrideTimer) {
+      clearTimeout(this._globalSkinOverrideTimer);
+      this._globalSkinOverrideTimer = null;
+    }
+    const g = this.globalSkinOverride;
+    if (!g || !g.expiresAt) return;
+    const remaining = Date.parse(g.expiresAt) - Date.now();
+    // setTimeout caps at 2^31-1 ms; longer deadlines re-arm when they fire.
+    const wait = Math.max(0, Math.min(remaining, 2147483647));
+    this._globalSkinOverrideTimer = setTimeout(() => {
+      this._globalSkinOverrideTimer = null;
+      if (!this.globalSkinOverride) return;
+      if (Date.parse(this.globalSkinOverride.expiresAt) - Date.now() > 0) {
+        this._armGlobalSkinOverrideTimer();
+        return;
+      }
+      this._expireGlobalSkinOverride();
+    }, wait);
+    this._globalSkinOverrideTimer.unref?.();
+  }
+
+  /** Drops an expired global override and tells every room to revert. */
+  _expireGlobalSkinOverride() {
+    if (!this.globalSkinOverride) return;
+    this.globalSkinOverride = null;
+    if (this._globalSkinOverrideTimer) {
+      clearTimeout(this._globalSkinOverrideTimer);
+      this._globalSkinOverrideTimer = null;
+    }
+    this._persistGlobalSkinOverride().catch?.(() => {});
+    for (const room of this._allRooms()) this._broadcastSkinsUpdated(room, 'admin_global_expired');
+  }
+
+  async _persistRoomQuietly(room) {
+    if (!this.failureManager?.persistGameState) return;
+    try {
+      await this.failureManager.persistGameState(room);
+    } catch (err) {
+      logger.warn(`[SKINS] room persistence failed: ${err.message}`);
+    }
+  }
+
+  async _persistGlobalSkinOverride() {
+    if (!this.failureManager?.persistGlobalSkinOverride) return;
+    try {
+      await this.failureManager.persistGlobalSkinOverride(this.globalSkinOverride);
+    } catch (err) {
+      logger.warn(`[SKINS] global override persistence failed: ${err.message}`);
+    }
+  }
+
+  /** Startup: reloads the persisted global override (if it has not expired). */
+  async restoreGlobalSkinOverride() {
+    if (!this.failureManager?.loadGlobalSkinOverride) return null;
+    try {
+      const state = await this.failureManager.loadGlobalSkinOverride();
+      if (state && state.skins && (!state.expiresAt || Date.parse(state.expiresAt) > Date.now())) {
+        this.globalSkinOverride = {
+          skins: this._sanitizeOverrideSkins(state.skins),
+          expiresAt: state.expiresAt || null,
+          setBy: state.setBy || null,
+          setAt: state.setAt || new Date().toISOString(),
+        };
+        this._armGlobalSkinOverrideTimer();
+        logger.info('[SKINS] global override restored', {
+          expiresAt: this.globalSkinOverride.expiresAt,
+        });
+      }
+    } catch (err) {
+      logger.warn(`[SKINS] global override restore failed: ${err.message}`);
+    }
+    return this.globalSkinOverride;
+  }
+
   _broadcastRoomSettingsChange(room, before) {
     if (!room || room.status !== GameRoomStatus.WAITING) return;
     const after = this._roomSettingsSnapshot(room);
@@ -3203,6 +3577,9 @@ class SocketHandlers {
         isConnected: player.isConnected,
         isBot: player.isBot === true,
       })),
+      spectatorCount: this.roomSpectators.get(room.roomId)?.size ?? 0,
+      ...this._skinsPayloadFields(room),
+      skinOverride: room.skinOverride ? { ...room.skinOverride } : null,
     };
 
     this._logRoomLifecycle('runtime_snapshot_generated', {
@@ -4296,10 +4673,13 @@ class SocketHandlers {
     if (!backendUrl || typeof fetch !== 'function') return;
     const headers = { 'Content-Type': 'application/json' };
     if (config.backend.webhookSecret) headers['x-webhook-secret'] = config.backend.webhookSecret;
+    // `spectatorCount` rides along so the lobby can show who is watching, not
+    // just who is seated; the backend stores it next to current_players.
+    const spectatorCount = this.roomSpectators.get(String(roomId))?.size ?? 0;
     fetch(`${backendUrl.replace(/\/$/, '')}/api/webhooks/room-player-count`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ roomId: String(roomId), playerCount: totalCount }),
+      body: JSON.stringify({ roomId: String(roomId), playerCount: totalCount, spectatorCount }),
     }).catch((err) =>
       logger.warn(`[BOT] backend room-player-count webhook failed: ${err.message}`)
     );
@@ -4959,6 +5339,9 @@ class SocketHandlers {
       count: spectators.length,
       timestamp: new Date().toISOString(),
     });
+    // The lobby shows the watcher count too; it travels with the seat count.
+    const room = this.gameService.getRoom(roomId);
+    if (room) this._notifyBackendPlayerCount(roomId, room.players.size);
   }
 
   _expireSwap(room, targetPlayerId) {
@@ -6071,7 +6454,7 @@ class SocketHandlers {
       //     drop, or never learn on a cold resync.
       turnTimeRemaining: room.getTurnTimeRemaining(),
       melds: room.serializeMelds(),
-      skins: room.skins || {},
+      ...this._skinsPayloadFields(room),
       cardsDealt: room.cardsDealt || false,
       hostId: room.hostPlayerId || null,
       // Carry the first-turn "undian" result here too: clients commonly catch up
@@ -6358,6 +6741,13 @@ class SocketHandlers {
         // Mark player as disconnected in the room
         // This will automatically trigger room cleanup if all players are disconnected
         this.gameService.handlePlayerDisconnection(playerId);
+      }
+
+      // A seat that drops mid-deal can no longer report deal_animation_complete.
+      // If everyone still at the table already has, start the first turn now
+      // instead of making them wait out DEAL_ANIMATION_FALLBACK_MS for it.
+      if (room.awaitingDealAnimation) {
+        this._startFirstTurnTimerIfDealAcked(room, `disconnect of ${playerId}`);
       }
     }
 
@@ -7243,7 +7633,7 @@ class SocketHandlers {
           players: room.getPlayers().map((mp) => this._serializePlayer(mp)),
           yourPlayerIndex: p.playerIndex,
           currentPlayerIndex: this._announcedTurnIndex(room),
-          skins: room.skins || {},
+          ...this._skinsPayloadFields(room),
           cardsDealt: room.cardsDealt || false,
           hostId: room.hostPlayerId || null,
           turnTimeLimitSeconds: room.turnTimeLimit,
@@ -7722,7 +8112,7 @@ class SocketHandlers {
               // dirty (the PRO sticky-dirty flag is server-only state). The
               // server has always built this array; until now nothing emitted it.
               melds: meldFlags,
-              skins: room.skins || {},
+              ...this._skinsPayloadFields(room),
               timestamp: new Date().toISOString(),
               cardsDealt: room.cardsDealt || false,
               hostId: room.hostPlayerId || null,
@@ -8472,7 +8862,7 @@ class SocketHandlers {
               professionalWellMode: room.professionalWellMode,
               turnTimeLimitSeconds: room.turnTimeLimit,
               cardsDealt: room.cardsDealt || false,
-              skins: room.skins || {},
+              ...this._skinsPayloadFields(room),
               timestamp: new Date().toISOString(),
             });
 

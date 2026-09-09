@@ -154,6 +154,9 @@ class GameRoom {
     this.targetScore = 0;
     /** In-game chat toggle. When false the server suppresses chat broadcast. */
     this.chatEnabled = true;
+    // Admin per-game skin override: { skins, setBy, setAt } or null. Lives and
+    // dies with the room (survives round intermissions, not a new game).
+    this.skinOverride = null;
     /**
      * Lobby visibility ('public' | 'private'), mirrored from the sync-room
      * payload. Used for the ROOM_SETTINGS_CHANGED lobby broadcast; the socket

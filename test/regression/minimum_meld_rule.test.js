@@ -437,19 +437,27 @@ describe('#minimum meld once a side is past 1000', () => {
     room.playerHasTakenPozzetto.set('p1', true);
     ActionHandlers._startTurnForPlayer(room, 'p1');
 
-    // A seven-card run: a brazilia (so the close is legal) worth 50 — under 75.
-    const run = [
-      c('4', 'hearts'),
-      c('5', 'hearts'),
-      c('6', 'hearts'),
-      c('7', 'hearts'),
-      c('8', 'hearts'),
-      c('9', 'hearts'),
-      c('10', 'hearts'),
-    ];
-    room.playerHands.set('p1', [...run]);
+    // The brazilia that makes the close legal was laid on an EARLIER turn (so
+    // it earns nothing this turn — since 2026-09-05 a fresh buraco's bonus
+    // counts toward the bar, and a seven-card run would clear 75 on its own).
+    room.playerMelds.set('p1', [
+      [
+        c('4', 'hearts'),
+        c('5', 'hearts'),
+        c('6', 'hearts'),
+        c('7', 'hearts'),
+        c('8', 'hearts'),
+        c('9', 'hearts'),
+        c('10', 'hearts'),
+      ],
+    ]);
+    room.playerMeldOrders.set('p1', [1]);
+    // This turn's going-down: 8-9-10-J-Q, worth 50 — enough to go down at
+    // all, under the 75 bar — and it empties the hand.
+    const short = [c('8', 'clubs'), c('9', 'clubs'), c('10', 'clubs'), c('J', 'clubs'), c('Q', 'clubs')];
+    room.playerHands.set('p1', [...short]);
 
-    const res = ActionHandlers.handleGoingDown(room, 'p1', [run]);
+    const res = ActionHandlers.handleGoingDown(room, 'p1', [short]);
 
     expect(res.success, res.error).to.equal(true);
     expect(res.roundEnded, 'the round must NOT close under the bar').to.equal(undefined);
@@ -459,8 +467,8 @@ describe('#minimum meld once a side is past 1000', () => {
       required: 75,
     });
     expect(room.teamRequiredMeldPoints.get('teamA'), 'the bar escalated').to.equal(95);
-    expect(room.playerMelds.get('p1'), 'the short meld came off the table').to.have.length(0);
-    expect(room.playerHands.get('p1'), 'and back into the hand').to.have.length(7);
+    expect(room.playerMelds.get('p1'), 'the short meld came off the table').to.have.length(1);
+    expect(room.playerHands.get('p1'), 'and back into the hand').to.have.length(5);
     expect(room.status, 'the room is still live').to.not.equal('finished');
   });
 
