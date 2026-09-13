@@ -139,6 +139,120 @@ describe('SocketHandlers', () => {
     }
   });
 
+  describe('first-turn timer waits for every seated human to finish the deal', () => {
+    // Clients run the opening deal at their own animation SPEED setting (the
+    // SDK's "fast" is ~half the reference length), so the room's shared clock
+    // must not start on the quickest report — the slower seat would lose turn
+    // time to its own deal animation.
+    const dealtRoom = () => {
+      const ctx = setupStartedRoom();
+      ctx.handler.handleStartGame(ctx.s1, {});
+      expect(ctx.room.awaitingDealAnimation).to.equal(true);
+      expect(ctx.room.dealAnimationAcks).to.be.instanceOf(Set);
+      return ctx;
+    };
+
+    it('does not start on the first report while another seat is still animating', () => {
+      const { service, handler, room, s1, s2 } = dealtRoom();
+      try {
+        handler.handleDealAnimationComplete(s1, {});
+        expect(room.awaitingDealAnimation).to.equal(true);
+        expect(room.turnTimerTickHandle).to.equal(null);
+        expect(room.dealAnimationFallbackHandle).to.not.equal(null);
+
+        handler.handleDealAnimationComplete(s2, {});
+        expect(room.awaitingDealAnimation).to.equal(false);
+        expect(room.dealAnimationFallbackHandle).to.equal(null);
+        expect(room.firstTurnDraw).to.equal(null);
+      } finally {
+        cleanupRoom(service, handler, room);
+      }
+    });
+
+    it('a repeated report from the same seat does not count twice', () => {
+      const { service, handler, room, s1 } = dealtRoom();
+      try {
+        handler.handleDealAnimationComplete(s1, {});
+        handler.handleDealAnimationComplete(s1, {});
+        expect(room.awaitingDealAnimation).to.equal(true);
+        expect(room.dealAnimationAcks.size).to.equal(1);
+      } finally {
+        cleanupRoom(service, handler, room);
+      }
+    });
+
+    it("a spectator's report never stands in for a seat's", () => {
+      const { service, handler, room, s1, s2, io } = dealtRoom();
+      const spectator = createSocketMock('spec-1');
+      io.sockets.sockets.set(spectator.id, spectator);
+      handler.spectatorSocketToRoom.set(spectator.id, room.roomId);
+      try {
+        handler.handleDealAnimationComplete(spectator, {});
+        expect(room.awaitingDealAnimation).to.equal(true);
+
+        handler.handleDealAnimationComplete(s1, {});
+        handler.handleDealAnimationComplete(s2, {});
+        expect(room.awaitingDealAnimation).to.equal(false);
+      } finally {
+        handler.spectatorSocketToRoom.delete(spectator.id);
+        cleanupRoom(service, handler, room);
+      }
+    });
+
+    it('a bot seat never holds the first turn', () => {
+      const { service, handler, room, s1 } = dealtRoom();
+      try {
+        room.getPlayer('p2').isBot = true;
+        handler.handleDealAnimationComplete(s1, {});
+        expect(room.awaitingDealAnimation).to.equal(false);
+      } finally {
+        cleanupRoom(service, handler, room);
+      }
+    });
+
+    it('a seat that drops mid-deal releases the others once they have reported', async () => {
+      const { service, handler, room, s1, s2 } = dealtRoom();
+      try {
+        handler.handleDealAnimationComplete(s1, {});
+        expect(room.awaitingDealAnimation).to.equal(true);
+
+        await handler.handleDisconnect(s2, 'transport close');
+        expect(room.getPlayer('p2').isConnected).to.equal(false);
+        expect(room.awaitingDealAnimation).to.equal(false);
+      } finally {
+        cleanupRoom(service, handler, room);
+      }
+    });
+
+    it('a drop before anyone reported is left to the fallback', async () => {
+      const { service, handler, room, s2 } = dealtRoom();
+      try {
+        await handler.handleDisconnect(s2, 'transport close');
+        expect(room.awaitingDealAnimation).to.equal(true);
+        expect(room.dealAnimationFallbackHandle).to.not.equal(null);
+      } finally {
+        cleanupRoom(service, handler, room);
+      }
+    });
+
+    it('a real turn start drops the gate, so a late report cannot restart the clock', () => {
+      const { service, handler, room, s1, s2 } = dealtRoom();
+      try {
+        handler.handleDealAnimationComplete(s1, {});
+        // The quick seat acts before the slow one has finished animating; the
+        // turn clock that starts with that play is the one that stands.
+        handler._startTurnTimer(room);
+        expect(room.awaitingDealAnimation).to.equal(false);
+        const handleAfterPlay = room.turnTimerTickHandle;
+
+        handler.handleDealAnimationComplete(s2, {});
+        expect(room.turnTimerTickHandle).to.equal(handleAfterPlay);
+      } finally {
+        cleanupRoom(service, handler, room);
+      }
+    });
+  });
+
   it('repairs an in-progress room that was started before cards were dealt', () => {
     const { service, handler, room, s1 } = setupStartedRoom();
 

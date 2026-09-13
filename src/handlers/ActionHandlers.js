@@ -360,6 +360,10 @@ class ActionHandlers {
     room.playerHands.set(playerId, hand);
     room.playerMelds.set(playerId, playerMelds);
     room.playerMeldOrders.set(playerId, playerMeldOrders);
+    // A seat with no melds yet started from a fresh `[]` that was not in
+    // room.playerMelds while the loop ran, so the per-meld recompute above saw
+    // an empty table. Now that the melds are stored, price them (buraco bonus).
+    this._recomputeTurnMeldPoints(room, playerId);
 
     // Going down lays multiple melds at once; undo of the batch is not supported.
     room.drawnCardThisTurnRestriction = new Set();
@@ -465,6 +469,18 @@ class ActionHandlers {
     if (!melds[targetMeldIndex]) {
       return { success: false, error: 'Target meld not found' };
     }
+    // The grade latch this meld carried BEFORE the add. An UNDO puts it back
+    // (lastMeldSnapshot.savedLatch) and an end-of-turn confiscation restores
+    // the pre-turn one (_rememberTurnLatch -> _returnTurnMeldsToHand). Without
+    // both, a wild added and then taken back left the meld branded 'semi' /
+    // 'dirty' with no wild on the table — and since the bar now reads the
+    // bonus, that stale brand under-priced the side's next natural card by 100
+    // for the bar AND the scoreboard.
+    const savedLatch = this._latchedGrade(
+      room.meldDirtyFlags.get(targetPlayer.playerId),
+      targetMeldIndex
+    );
+    this._rememberTurnLatch(room, targetPlayer.playerId, targetMeldIndex, savedLatch);
     melds[targetMeldIndex].push(...resolvedCards);
 
     const ruleset = room.ruleset || 'classic';
@@ -505,6 +521,7 @@ class ActionHandlers {
       savedRestriction,
       savedDiscardLock,
       wasMeldedBefore,
+      savedLatch,
     };
 
     // Auto-take dead pile if acting player emptied hand
@@ -658,8 +675,14 @@ class ActionHandlers {
         }
         room.playerMelds.set(targetPlayerId, melds);
         // If the meld is now empty, remove it — through the same helper, so the
-        // orders array and the dirty flags follow.
+        // orders array and the dirty flags follow. Otherwise the meld survives
+        // with the added cards gone, and its latch goes back to what it was
+        // before them: a latch records how a buraco was BUILT, and an undone
+        // add was never built.
         if (meld.length === 0) this._dropMeldAt(room, targetPlayerId, snap.meldIndex);
+        else if ('savedLatch' in snap) {
+          this._setLatch(room, targetPlayerId, snap.meldIndex, snap.savedLatch);
+        }
       } else {
         room.playerMelds.set(targetPlayerId, melds);
       }
@@ -892,6 +915,11 @@ class ActionHandlers {
       discardLock: room.discardLocks.get(playerId) || null,
       teamKey,
       teamMeldPoints: room.teamMeldPointsThisTurn.get(teamKey),
+      // The confiscation list goes back with the points. Left standing, the
+      // rolled-back cards stayed on it while ALSO back in the hand, so a later
+      // confiscation dealt them into the hand a second time — and now that the
+      // points are rebuilt from this list, they would be counted again too.
+      turnMelded: [...(room.turnMeldedCards?.get(playerId) || [])],
       lastMeldSnapshot: room.lastMeldSnapshot,
     };
   }
@@ -911,6 +939,10 @@ class ActionHandlers {
     else room.discardLocks.delete(playerId);
     if (snap.teamMeldPoints === undefined) room.teamMeldPointsThisTurn.delete(snap.teamKey);
     else room.teamMeldPointsThisTurn.set(snap.teamKey, snap.teamMeldPoints);
+    if (snap.turnMelded) {
+      if (!room.turnMeldedCards) room.turnMeldedCards = new Map();
+      room.turnMeldedCards.set(playerId, [...snap.turnMelded]);
+    }
     room.lastMeldSnapshot = snap.lastMeldSnapshot;
   }
 
@@ -1424,19 +1456,93 @@ class ActionHandlers {
   }
 
   /**
-   * Record what a player laid down this turn: the POINTS (per side, for the
-   * minimum-meld test) and the CARDS themselves (per player, so a turn that ends
-   * short can hand them back). Runs in every ruleset — the minimum applies to
-   * direct and indirect alike.
+   * Record what a player laid down this turn: the CARDS themselves (per player,
+   * so a turn that ends short can hand them back) and, derived from them, the
+   * POINTS (per side, for the minimum-meld test). Runs in every ruleset — the
+   * minimum applies to direct and indirect alike.
+   *
+   * Call it AFTER the cards are on the table: the points are rebuilt from the
+   * melds as they stand (see _recomputeTurnMeldPoints), so a meld that is not
+   * yet in room.playerMelds cannot earn its bonus.
    */
   static _trackTurnMeldPoints(room, playerId, cards) {
-    const teamKey = this._teamKeyForPlayer(room, playerId);
-    const total = cards.reduce((sum, c) => sum + this._cardValue(c, room.ruleset), 0);
-    room.teamMeldPointsThisTurn.set(teamKey, (room.teamMeldPointsThisTurn.get(teamKey) || 0) + total);
+    this._recordTurnMeldCards(room, playerId, cards);
+    this._recomputeTurnMeldPoints(room, playerId);
+  }
+
+  /** The confiscation list only — no points. See _trackTurnMeldPoints. */
+  static _recordTurnMeldCards(room, playerId, cards) {
     if (!room.turnMeldedCards) room.turnMeldedCards = new Map();
     const laid = room.turnMeldedCards.get(playerId) || [];
     laid.push(...cards);
     room.turnMeldedCards.set(playerId, laid);
+  }
+
+  /**
+   * Rebuild teamMeldPointsThisTurn — THE figure the minimum-meld bar is
+   * measured against — from the table as it stands:
+   *
+   *     card points of everything laid this turn (turnMeldedCards)
+   *   + every buraco bonus the side EARNED this turn
+   *
+   * The bonus was missing (reported 2026-09-05: "meld 2,3,4,5,6,7,8, kan dapet
+   * 200 tuh, entah kenapa 200 ini ga masuk hitungan"). A seven-card clean run
+   * is 35 card points and a 200 bonus; against a 75 bar the old card-only sum
+   * read it as 35, confiscated it and raised the bar — for the strongest
+   * going-down in the game. Any bonus counts: 200 clean, 100 semi/dirty, 2000
+   * for a buraco of 2s. "Ga hanya bonus 200, bonus 100 juga terhitung."
+   *
+   * Rebuilt rather than accumulated because a bonus is a property of the MELD,
+   * not of the cards: it appears when the seventh card lands (which may be an
+   * add to a six-card meld from an earlier turn), it is worth nothing more on
+   * the eighth, and an undo or a rollback takes it away again. Recomputing from
+   * the confiscation list makes every one of those paths agree by construction.
+   */
+  static _recomputeTurnMeldPoints(room, playerId) {
+    const teamKey = this._teamKeyForPlayer(room, playerId);
+    const laid = room.turnMeldedCards?.get(playerId) || [];
+    const cardPoints = laid.reduce((sum, c) => sum + this._cardValue(c, room.ruleset), 0);
+    const total = cardPoints + this._buracoBonusEarnedThisTurn(room, playerId, laid);
+    room.teamMeldPointsThisTurn.set(teamKey, total);
+    return total;
+  }
+
+  /**
+   * Buraco bonus the side gained through the cards `laid` this turn.
+   *
+   * Per meld that holds at least one of those cards: what it pays NOW minus what
+   * it paid BEFORE this turn's cards arrived (the meld with them filtered out —
+   * exactly what _returnTurnMeldsToHand would leave behind), floored at zero.
+   *   fresh 2-3-4-5-6-7-8            -> 0 before, 200 now  -> +200
+   *   6-card run + the 7th this turn -> 0 before, 100/200  -> +bonus
+   *   8th card onto a buraco         -> same price both ways -> +0
+   *   a wild that DEMOTES a clean buraco -> 200 before? no: the latch is read
+   *     for both sides, so both read the demoted price and the turn earns 0.
+   *     A lost bonus is not a debt on this turn's going-down.
+   * The latch is the meld's CURRENT one for both readings: it is downgrade-only
+   * and only ever set at seven cards, so on a meld that was short before this
+   * turn it is this turn's own verdict, and on a meld that was already a buraco
+   * it caps both readings alike.
+   */
+  static _buracoBonusEarnedThisTurn(room, playerId, laid) {
+    if (!Array.isArray(laid) || laid.length === 0) return 0;
+    const ruleset = room.ruleset || 'classic';
+    const ids = new Set(laid.map((c) => String(this._cardId(c))));
+    let earned = 0;
+    for (const teammate of this._teamPlayers(room, playerId)) {
+      const melds = room.playerMelds.get(teammate.playerId) || [];
+      const flags = room.meldDirtyFlags?.get(teammate.playerId);
+      melds.forEach((meld, index) => {
+        if (!Array.isArray(meld)) return;
+        const before = meld.filter((c) => !ids.has(String(this._cardId(c))));
+        if (before.length === meld.length) return; // untouched this turn
+        const latched = this._latchedGrade(flags, index);
+        const now = this._meldBonus(meld, ruleset, latched);
+        const was = this._meldBonus(before, ruleset, latched);
+        earned += Math.max(0, now - was);
+      });
+    }
+    return earned;
   }
 
   /**
@@ -1457,8 +1563,9 @@ class ActionHandlers {
    *     the same instances into the hand a SECOND time: duplicate cardIds, both
    *     meldable and both summed by the hand penalty.
    *
-   * Subtracting (not zeroing) is right here: an undo takes back ONE meld, and
-   * anything else laid this turn is still on the table.
+   * Taking back ONE meld (not zeroing) is right here: anything else laid this
+   * turn is still on the table and keeps its credit — the points are rebuilt
+   * from what remains.
    *
    * @param {GameRoom} room
    * @param {string} playerId
@@ -1466,19 +1573,18 @@ class ActionHandlers {
    */
   static _untrackTurnMeldPoints(room, playerId, cards) {
     if (!Array.isArray(cards) || cards.length === 0) return;
-    const teamKey = this._teamKeyForPlayer(room, playerId);
-    const total = cards.reduce((sum, c) => sum + this._cardValue(c, room.ruleset), 0);
-    room.teamMeldPointsThisTurn.set(
-      teamKey,
-      Math.max(0, (room.teamMeldPointsThisTurn.get(teamKey) || 0) - total)
-    );
-    if (!room.turnMeldedCards) return;
-    const ids = new Set(cards.map((c) => String(this._cardId(c))));
-    const laid = room.turnMeldedCards.get(playerId) || [];
-    room.turnMeldedCards.set(
-      playerId,
-      laid.filter((c) => !ids.has(String(this._cardId(c))))
-    );
+    if (room.turnMeldedCards) {
+      const ids = new Set(cards.map((c) => String(this._cardId(c))));
+      const laid = room.turnMeldedCards.get(playerId) || [];
+      room.turnMeldedCards.set(
+        playerId,
+        laid.filter((c) => !ids.has(String(this._cardId(c))))
+      );
+    }
+    // Rebuilt from the table, not subtracted: the undone meld's cards leave
+    // with their card points AND with whatever buraco bonus they had earned.
+    // Call it after the meld itself is gone from room.playerMelds.
+    this._recomputeTurnMeldPoints(room, playerId);
   }
 
   /**
@@ -1530,7 +1636,9 @@ class ActionHandlers {
       const melds = room.playerMelds.get(teammate.playerId) || [];
       const orders = room.playerMeldOrders.get(teammate.playerId) || [];
       let dirty = this._gradeFlags(room.meldDirtyFlags.get(teammate.playerId));
+      const latchBefore = room.turnLatchBefore?.get(teammate.playerId);
       for (let i = melds.length - 1; i >= 0; i -= 1) {
+        const had = melds[i].length;
         melds[i] = melds[i].filter((c) => !ids.has(String(this._cardId(c))));
         if (melds[i].length === 0) {
           melds.splice(i, 1);
@@ -1544,12 +1652,29 @@ class ActionHandlers {
             shifted.set(idx > i ? idx - 1 : idx, grade);
           });
           dirty = shifted;
+        } else if (melds[i].length !== had) {
+          // The meld survives with this turn's cards gone, so its grade goes
+          // back to what it was before the turn (recorded on the first touch,
+          // _rememberTurnLatch). A latch is a fact about how a buraco was
+          // BUILT, and a confiscated add was never built: leaving it let a
+          // joker laid as the 7th and handed straight back brand the six
+          // naturals 'semi' forever. Without a record (a room restored
+          // mid-turn) fall back to the one rule that needs no history: no
+          // grade exists below seven cards.
+          if (latchBefore && latchBefore.has(i)) {
+            const grade = latchBefore.get(i);
+            if (grade == null) dirty.delete(i);
+            else dirty.set(i, grade);
+          } else if (melds[i].length < BURACO_SIZE) {
+            dirty.delete(i);
+          }
         }
       }
       room.playerMelds.set(teammate.playerId, melds);
       room.playerMeldOrders.set(teammate.playerId, orders);
       room.meldDirtyFlags.set(teammate.playerId, dirty);
     }
+    room.turnLatchBefore = new Map();
 
     const hand = room.playerHands.get(playerId) || [];
     hand.push(...laid);
@@ -1597,8 +1722,10 @@ class ActionHandlers {
    *
    * Once a side's cumulative score passes 1000, its FIRST going-down of a round
    * has to be worth at least 75 points. Melds are provisional until then: what
-   * counts is the TOTAL laid down across the turn (30 then 45 is fine), and the
-   * verdict lands when the turn ends.
+   * counts is the TOTAL laid down across the turn (30 then 45 is fine) — card
+   * points PLUS any buraco bonus the turn earned (a fresh 2-3-4-5-6-7-8 is
+   * 35 + 200, see _recomputeTurnMeldPoints) — and the verdict lands when the
+   * turn ends.
    *
    *   pass -> the melds stand and the requirement is done for the round
    *   fail -> every card laid this turn goes back to the hand and the SIDE's
@@ -1670,6 +1797,7 @@ class ActionHandlers {
     const teamKey = this._teamKeyForPlayer(room, playerId);
     room.teamMeldPointsThisTurn.set(teamKey, 0);
     if (room.turnMeldedCards) room.turnMeldedCards.set(playerId, []);
+    room.turnLatchBefore = new Map();
     // Arm the minimum the moment this side is past 1000. `null` means "never
     // been there"; 0 means "already met it this round", and neither is
     // overwritten here.
@@ -1747,6 +1875,33 @@ class ActionHandlers {
     if (!flags) return undefined;
     if (flags instanceof Map) return flags.get(index);
     return flags.has && flags.has(index) ? 'dirty' : undefined;
+  }
+
+  /**
+   * Write meld [index]'s latch outright — `grade` 'semi' | 'dirty' sets it,
+   * null/undefined clears it. Only the two restore paths (undo, end-of-turn
+   * confiscation) may write UPWARD; every live path goes through
+   * _latchMeldGrade, which is downgrade-only.
+   */
+  static _setLatch(room, ownerId, index, grade) {
+    const flags = this._gradeFlags(room.meldDirtyFlags.get(ownerId));
+    if (grade == null) flags.delete(index);
+    else flags.set(index, grade);
+    room.meldDirtyFlags.set(ownerId, flags);
+  }
+
+  /**
+   * Remember the latch meld [index] of `ownerId` carried the FIRST time this
+   * turn touched it, so a confiscation at the end of the turn can put it back
+   * (_returnTurnMeldsToHand). Later touches in the same turn keep the first
+   * record — that is the pre-turn state. Reset at turn start and once the
+   * confiscation has used it.
+   */
+  static _rememberTurnLatch(room, ownerId, index, latched) {
+    if (!room.turnLatchBefore) room.turnLatchBefore = new Map();
+    const rec = room.turnLatchBefore.get(ownerId) || new Map();
+    if (!rec.has(index)) rec.set(index, latched ?? null);
+    room.turnLatchBefore.set(ownerId, rec);
   }
 
   static _isDirtyMeld(meld, ruleset) {
@@ -2309,6 +2464,35 @@ class ActionHandlers {
     return 100;
   }
 
+  /** A buraco built entirely of real 2s (see _isAllTwosMeld). */
+  static get SPECIAL_TWOS_BONUS() {
+    return 2000;
+  }
+
+  /**
+   * What ONE meld pays right now — the whole bonus ladder for a single meld,
+   * `latched` being its room.meldDirtyFlags grade (see _latchedGrade).
+   *
+   *   below seven cards -> 0
+   *   buraco of 2s      -> 2000
+   *   CLEAN             ->  200
+   *   semi / dirty      ->  100
+   *
+   * _braziliaStats prices the round with this; _buracoBonusEarnedThisTurn
+   * prices a turn's going-down for the minimum-meld bar with it. One ladder, so
+   * the bar can never disagree with the scoreboard about what a meld is worth.
+   * @param {Array} meld
+   * @param {string} ruleset
+   * @param {string|undefined} latched
+   * @returns {number}
+   */
+  static _meldBonus(meld, ruleset = 'classic', latched = undefined) {
+    if (!Array.isArray(meld) || meld.length < BURACO_SIZE) return 0;
+    if (this._isAllTwosMeld(meld)) return this.SPECIAL_TWOS_BONUS;
+    const grade = GameValidator.meldGrade(meld, ruleset, latched);
+    return grade === 'clean' ? this.CLEAN_BURACO_BONUS : this.BURACO_BONUS;
+  }
+
   /**
    * ROYAL RUN — one suit, natural cards only, every rank from the 2 up to the
    * Ace. Thirteen cards, no gaps, no wilds: the 2 must be the real 2 OF THAT
@@ -2355,7 +2539,7 @@ class ActionHandlers {
         // other path below would score it as a plain dirty buraco.
         if (this._isAllTwosMeld(meld)) {
           acc.twos += 1;
-          acc.bonus += 2000;
+          acc.bonus += this._meldBonus(meld, ruleset, undefined);
           return acc;
         }
 
@@ -2381,16 +2565,15 @@ class ActionHandlers {
 
         if (grade === 'clean') {
           acc.clean += 1;
-          acc.bonus += this.CLEAN_BURACO_BONUS;
         } else if (grade === 'semi') {
           // SEMI-CLEAN pays the DIRTY figure (product decision 2026-09-02).
           // It keeps its own label and count; it has no price of its own.
           acc.semiClean += 1;
-          acc.bonus += this.BURACO_BONUS;
         } else {
           acc.dirty += 1;
-          acc.bonus += this.BURACO_BONUS;
         }
+        // One ladder for the round AND for the minimum-meld bar: _meldBonus.
+        acc.bonus += this._meldBonus(meld, ruleset, latched);
         return acc;
       },
       { clean: 0, semiClean: 0, dirty: 0, twos: 0, royal: 0, bonus: 0 }

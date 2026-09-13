@@ -19,6 +19,36 @@ const { createRedisClient, createAdapterClients } = require('./utils/redisClient
 const InMemoryRedis = require('./utils/InMemoryRedis');
 const { SocketEvents } = require('./constants');
 const { ErrorHandler, rateLimiter, createSocketAuth } = require('./middleware');
+
+/** Reads a JSON request body (1 MB cap); rejects on malformed JSON. */
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > 1_000_000) {
+        reject(new Error('payload too large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(body || '{}'));
+      } catch (e) {
+        reject(e);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+/** JSON response helper for the raw http handlers. */
+function sendJson(res, statusCode, payload) {
+  res.statusCode = statusCode;
+  res.setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify(payload));
+}
+
 const logger = require('./utils/logger');
 const PartnerWebhookRelay = require('./integrations/PartnerWebhookRelay');
 const { BotCoordinator } = require('./bots');
@@ -221,6 +251,70 @@ class BraziliaServer {
               res.end(JSON.stringify({ error: 'Internal Server Error' }));
             }
           });
+          return;
+        }
+
+        // ── Admin skin override + live room listing (webhook-secret guarded) ──
+        // POST /webhooks/skin-override { action: 'set'|'clear', scope: 'room'|'global',
+        //   roomId?, skins?, durationMs?|expiresAt?, setBy? }   GET → status
+        // GET  /webhooks/admin-rooms → every live room with seats, watchers, skins
+        if (
+          req.url.startsWith('/webhooks/skin-override') ||
+          req.url.startsWith('/webhooks/admin-rooms')
+        ) {
+          const secret = req.headers['x-webhook-secret'];
+          if (
+            this.config.security.webhookSecret &&
+            secret !== this.config.security.webhookSecret
+          ) {
+            logger.warn('[WEBHOOK] Unauthorized admin webhook', {
+              source: 'webhook',
+              event: 'skin_override',
+              requestId,
+            });
+            sendJson(res, 401, { error: 'Unauthorized' });
+            return;
+          }
+          const route = req.url.split('?')[0];
+          (async () => {
+            try {
+              if (route === '/webhooks/admin-rooms' && req.method === 'GET') {
+                sendJson(res, 200, this.socketHandlers.listRoomsForAdmin());
+                return;
+              }
+              if (route === '/webhooks/skin-override' && req.method === 'GET') {
+                sendJson(res, 200, this.socketHandlers.getSkinOverrideStatus());
+                return;
+              }
+              if (route === '/webhooks/skin-override' && req.method === 'POST') {
+                const data = await readJsonBody(req);
+                const result =
+                  data.action === 'clear'
+                    ? await this.socketHandlers.clearSkinOverride(data)
+                    : await this.socketHandlers.setSkinOverride(data);
+                logger.info('[WEBHOOK] skin-override processed', {
+                  source: 'webhook',
+                  event: 'skin_override',
+                  action: data.action === 'clear' ? 'clear' : 'set',
+                  scope: data.scope,
+                  roomId: data?.roomId ? String(data.roomId) : null,
+                  requestId,
+                  success: result.success,
+                });
+                sendJson(res, result.success ? 200 : 400, result);
+                return;
+              }
+              sendJson(res, 404, { error: 'Not Found' });
+            } catch (e) {
+              logger.error('[WEBHOOK] admin webhook failed', {
+                source: 'webhook',
+                event: 'skin_override',
+                requestId,
+                error: e.message,
+              });
+              sendJson(res, 500, { error: 'Internal Server Error' });
+            }
+          })();
           return;
         }
 
@@ -810,6 +904,8 @@ class BraziliaServer {
         config: this.config,
       });
       this.socketHandlers.botCoordinator = this.botCoordinator;
+      // Admin-wide skin override survives restarts (until its own expiry).
+      await this.socketHandlers.restoreGlobalSkinOverride();
       // Single bot/turn engine: grace-expiry bot takeovers are routed through the
       // canonical BotCoordinator instead of FailureManager's old in-manager
       // draw/discard duplicate (P1-9).

@@ -33,6 +33,16 @@ const SocketEvents = {
   HOST_HEARTBEAT_PING: 'host_heartbeat_ping', // S → host socket: { roomId, seq, ts }
   HOST_HEARTBEAT_PONG: 'host_heartbeat_pong', // host → S: { roomId, seq }
   SPECTATORS_CHANGED: 'spectators_changed',
+  // Admin skin override (PTW skins-admin): the server decides which skins a
+  // table shows. Effective skins = per-game override (dies with the room) →
+  // global override (has an expiry) → the room owner's own skins → none (each
+  // client keeps its local choice). Fanned out to players AND spectators the
+  // moment an override is set, cleared or expires — mid-game included — and
+  // carried in every state payload (`skins`, `skinsSource`, `skinsExpiresAt`)
+  // so reconnects and late joins converge. Payload: { roomId, skins,
+  //   skinsSource: 'admin_room'|'admin_global'|'owner'|'none',
+  //   skinsExpiresAt: ISO|null, reason, timestamp }.
+  SKINS_UPDATED: 'skins_updated',
   INVITE_BOT: 'invite_bot',
   BOT_INVITED: 'bot_invited',
   REMOVE_BOT: 'remove_bot',

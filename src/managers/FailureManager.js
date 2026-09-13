@@ -156,6 +156,7 @@ class FailureManager extends EventEmitter {
         awaitingNextRound: room.awaitingNextRound === true,
         nextRoundAt: room.nextRoundAt || null,
         chatEnabled: room.chatEnabled,
+        skinOverride: room.skinOverride || null,
         visibility: room.visibility,
         hasPassword: room.hasPassword,
         bet: room.bet,
@@ -304,6 +305,53 @@ class FailureManager extends EventEmitter {
     }
   }
   
+  /** Redis key of the admin-wide skin override (survives restarts until it expires). */
+  static get GLOBAL_SKIN_OVERRIDE_KEY() {
+    return 'skins:global_override';
+  }
+
+  /**
+   * Persists (or removes, when `state` is null) the global skin override. The
+   * TTL follows the override's own expiry so an expired override never
+   * resurrects a table after a restart.
+   * @param {{skins: Object, expiresAt: (string|null), setBy: (string|null), setAt: string}|null} state
+   */
+  async persistGlobalSkinOverride(state) {
+    try {
+      const key = FailureManager.GLOBAL_SKIN_OVERRIDE_KEY;
+      if (!state) {
+        await this.redis.del(key);
+        return;
+      }
+      const json = JSON.stringify(state);
+      const expiresMs = state.expiresAt ? Date.parse(state.expiresAt) - Date.now() : NaN;
+      if (Number.isFinite(expiresMs)) {
+        if (expiresMs <= 0) {
+          await this.redis.del(key);
+          return;
+        }
+        await this.redis.setex(key, Math.ceil(expiresMs / 1000), json);
+      } else {
+        await this.redis.set(key, json);
+      }
+    } catch (error) {
+      this.logger.error(`[FailureManager] Global skin override persistence error: ${error.message}`);
+    }
+  }
+
+  /** The persisted global skin override, or null. */
+  async loadGlobalSkinOverride() {
+    try {
+      const json = await this.redis.get(FailureManager.GLOBAL_SKIN_OVERRIDE_KEY);
+      if (!json) return null;
+      const state = JSON.parse(json);
+      return state && typeof state === 'object' ? state : null;
+    } catch (error) {
+      this.logger.error(`[FailureManager] Global skin override load error: ${error.message}`);
+      return null;
+    }
+  }
+
   /**
    * Load all persisted games on server startup
    */
@@ -1021,6 +1069,8 @@ class FailureManager extends EventEmitter {
       ? Number(state.nextRoundAt)
       : null;
     room.chatEnabled = state.chatEnabled ?? room.chatEnabled;
+    room.skinOverride =
+      state.skinOverride && typeof state.skinOverride === 'object' ? state.skinOverride : null;
     room.visibility = state.visibility || room.visibility;
     room.hasPassword = state.hasPassword ?? room.hasPassword;
     room.bet = Number.isFinite(Number(state.bet)) ? Number(state.bet) : room.bet;
