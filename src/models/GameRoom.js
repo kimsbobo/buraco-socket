@@ -58,6 +58,7 @@ class GameRoom {
     // authoritative for the host identity. Blocks the first-joiner host fallback
     // from ever reassigning the host away from what the backend synced.
     this.backendManaged = false;
+    this.seatReservationProtocol = 0;
     this.ownerControllerPlayerId = null;
     this.ownerControllerSocketId = null;
     this.replacedHostBotId = null;
@@ -426,6 +427,11 @@ class GameRoom {
   addPlayer(player) {
     if (this.isFull()) return false;
     if (this.players.has(player.playerId)) return false;
+    // All join paths share this invariant, including spectator claims and
+    // restored sessions: one player per valid seat, regardless of player count.
+    if (!Number.isInteger(player.playerIndex) ||
+        player.playerIndex < 0 || player.playerIndex >= this.maxPlayers) return false;
+    if (this.getPlayerByIndex(player.playerIndex)) return false;
 
     this.players.set(player.playerId, player);
     // Mark that this room has been occupied at least once. Used when the room is

@@ -164,6 +164,12 @@ class SocketHandlers {
     // while the seat is still bound to the socket it just lost. See
     // `handleGetGameState`.
     this._pendingJoins = new Map();
+    // Room/player scope also serializes retries arriving on a replacement socket.
+    this._pendingSeatClaims = new Map();
+    this._seatMutations = new Map();
+    // A timed-out refund may still commit at the API. Never admit that same
+    // reservation again until its rejection has been reconciled.
+    this._unresolvedSeatRejections = new Map();
 
     // `${roomId}:${playerId}` -> setTimeout id. Pending pre-game seat-hold leaves
     // (A1): a WAITING-phase disconnect schedules the real leave/teardown here and
@@ -897,18 +903,18 @@ class SocketHandlers {
       existing && existing.spectatorName !== SPECTATOR_FALLBACK_NAME
         ? existing.spectatorName
         : '';
-    spectators.set(socket.id, {
-      spectatorId:
-        verifiedId ||
-        spectatorId ||
-        (existing && existing.spectatorId) ||
-        `spectator_${socket.id}`,
+    const resolvedId = verifiedId || spectatorId || existing?.spectatorId || `spectator_${socket.id}`;
+    // A profile refresh preserves the registration used by in-flight claims.
+    // Leaving and registering again creates a new object, invalidating old work.
+    const registration = existing?.spectatorId === resolvedId ? existing : {};
+    spectators.set(socket.id, Object.assign(registration, {
+      spectatorId: resolvedId,
       spectatorName:
         (offered !== SPECTATOR_FALLBACK_NAME ? offered : '') ||
         knownName ||
         SPECTATOR_FALLBACK_NAME,
       avatarUrl: avatarUrl || (existing && existing.avatarUrl) || null,
-    });
+    }));
     this.spectatorSocketToRoom.set(socket.id, roomId);
   }
 
@@ -1236,16 +1242,23 @@ class SocketHandlers {
    */
   _broadcastLobbyPlayers(room, representative = null) {
     if (!room || typeof room.getPlayers !== 'function') return;
+    this.io.to(room.roomId).emit(
+      SocketEvents.PLAYER_JOINED,
+      this._lobbyPlayersPayload(room, representative)
+    );
+  }
+
+  _lobbyPlayersPayload(room, representative = null) {
     const seated = room.getPlayers();
     const head = representative || seated[0] || null;
-    this.io.to(room.roomId).emit(SocketEvents.PLAYER_JOINED, {
+    return {
       playerId: head ? head.playerId : '',
       playerName: head ? head.playerName : '',
       playerIndex: head ? head.playerIndex : -1,
       isBot: head ? head.isBot === true : false,
       players: seated.map((p) => this._serializePlayer(p)),
       timestamp: new Date().toISOString(),
-    });
+    };
   }
 
   /**
@@ -1973,7 +1986,26 @@ class SocketHandlers {
    * @param {Socket} socket
    * @param {Object} data
    */
-  async handleJoinRoom(socket, data) {
+  _serializeSeatMutation(key, work) {
+    const previous = this._seatMutations.get(key);
+    const operation = previous ? previous.catch(() => {}).then(work) : work();
+    const settled = Promise.resolve(operation);
+    this._seatMutations.set(key, settled);
+    settled.finally(() => {
+      if (this._seatMutations.get(key) === settled) this._seatMutations.delete(key);
+    }).catch(() => {});
+    return settled;
+  }
+
+  handleJoinRoom(socket, data) {
+    if (data?.isSpectator || data?.roomId == null || data?.playerId == null) {
+      return this._handleJoinRoom(socket, data);
+    }
+    return this._serializeSeatMutation(`${data.roomId}:${data.playerId}`,
+      () => this._handleJoinRoom(socket, data));
+  }
+
+  async _handleJoinRoom(socket, data) {
     const { playerId, playerName, roomId, isSpectator = false } = data;
     const avatarUrl = data?.avatarUrl || data?.photoUrl || data?.avatar || null;
     const normalizedRoomId = roomId === null || roomId === undefined ? roomId : String(roomId);
@@ -2139,6 +2171,38 @@ class SocketHandlers {
 
     const targetRoom = room;
 
+    // An older client clears its spectator flag before claim_seat succeeds.
+    // Reconnecting after losing that claim must not silently occupy a different
+    // seat. Let the API reservation decide whether an unseated user may join.
+    if (targetRoom.seatReservationProtocol === 1 && this._backendUrlForRoom(targetRoom.roomId) &&
+        !targetRoom.getPlayer(playerId) && targetRoom.status === GameRoomStatus.WAITING) {
+      if (!targetRoom.getPlayer(playerId)) {
+        let reservation;
+        try {
+          reservation = await this._fetchSeatReservation(targetRoom, playerId);
+          reservation = await this._reconcileSeatRejection(targetRoom, playerId, reservation);
+        } catch (err) {
+          socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Could not verify your seat. Please retry.'));
+          return;
+        }
+        if (socket.connected === false || this.gameService.getRoom(targetRoom.roomId) !== targetRoom ||
+            targetRoom.status !== GameRoomStatus.WAITING) return;
+        // An explicit claim queued during this lookup owns the desired chair.
+        // Yield to it instead of auto-seating the reconnect in another chair.
+        // Awaiting it here would deadlock the actor's mutation queue.
+        if (this._pendingSeatClaims.has(`${targetRoom.roomId}:${playerId}`)) return;
+        if (!reservation || reservation.isSpectator) {
+          await this.handleJoinRoom(socket, { ...data, isSpectator: true });
+          socket.emit('kicked', { toSpectator: true, reason: 'seat_taken', timestamp: new Date().toISOString() });
+          return;
+        }
+        if (!Number.isInteger(reservation.reservationVersion) || reservation.reservationVersion < 0) {
+          socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Could not verify your seat reservation. Please retry.'));
+          return;
+        }
+      }
+    }
+
     // The game already ENDED (e.g. inactivity forfeit) but the room lingers in
     // the finished-grace window. A player rejoining now must see the RESULT — not
     // be reconnected into a fresh game_started snapshot (which looks like the game
@@ -2300,6 +2364,14 @@ class SocketHandlers {
           logger.info(
             `[JOIN_ROOM] ↻ Player ${playerId} refreshed room ${targetRoom.roomId} on the SAME socket ${socket.id} — resync only, no reconnect announced`
           );
+        }
+
+        // The shipped lobby rebuilds its seats from PLAYER_JOINED, not
+        // PLAYER_RECONNECTED or an undealt game_state_update. A DC must replay
+        // that roster even when the returning player already owns a seat.
+        if (targetRoom.status === GameRoomStatus.WAITING) {
+          this._broadcastLobbyPlayers(targetRoom, result.player);
+          this._broadcastSpectatorsChanged(targetRoom.roomId);
         }
 
         // Re-sync full game state for all players to avoid divergence
@@ -3080,6 +3152,9 @@ class SocketHandlers {
     // Mark the room backend-owned so the first-joiner host fallbacks never
     // reassign the host away from what the backend synced.
     room.backendManaged = true;
+    // Opt in only when the owning backend supports versioned seat rejection.
+    // Other apps can share this socket server without implementing that API.
+    if (data.seatReservationProtocol === 1) room.seatReservationProtocol = 1;
 
     // Routing (1 socket → 2 backends): each backend may send its own callback
     // base URL so room-closed/left/count webhooks go back to the right app. When
@@ -5310,7 +5385,23 @@ class SocketHandlers {
   _swapFail(socket, reason, message, seat) {
     const payload = { reason, message, timestamp: new Date().toISOString() };
     if (Number.isInteger(seat)) payload.seat = seat;
-    if (socket) socket.emit('swap_failed', payload);
+    if (!socket) return;
+    socket.emit('swap_failed', payload);
+    if (reason === 'seat_taken') {
+      // The competing claim may have completed before this client received the
+      // winning roster. Reply with current occupancy as well as the rejection.
+      const playerId = this.gameService.getPlayerIdBySocket(socket.id);
+      const room = playerId
+        ? this.gameService.getPlayerRoom(playerId)
+        : this.gameService.getRoom(this.spectatorSocketToRoom.get(socket.id));
+      if (room && room.status === GameRoomStatus.WAITING) {
+        socket.emit('seat_changed', {
+          players: room.getPlayers().map((p) => this._serializePlayer(p)),
+          timestamp: new Date().toISOString(),
+        });
+        socket.emit(SocketEvents.PLAYER_JOINED, this._lobbyPlayersPayload(room));
+      }
+    }
   }
 
   /** Authoritative roster broadcast after any seat mutation. */
@@ -5382,6 +5473,159 @@ class SocketHandlers {
    * @param {Object} data { seat }
    */
   handleClaimSeat(socket, data = {}) {
+    const roomId = this.spectatorSocketToRoom.get(socket.id);
+    const room = roomId ? this.gameService.getRoom(roomId) : null;
+    const spectator = this.roomSpectators.get(roomId)?.get(socket.id);
+    if (room?.seatReservationProtocol !== 1 || !this._backendUrlForRoom(roomId) || !spectator ||
+        this.gameService.getPlayerIdBySocket(socket.id)) {
+      return this._claimSeatNow(socket, data);
+    }
+
+    const key = `${roomId}:${spectator.spectatorId}`;
+    const pending = this._pendingSeatClaims.get(key);
+    if (pending) {
+      if (pending.socketId === socket.id) return pending.promise;
+      // A replacement connection needs its own response once the old attempt
+      // settles; otherwise its optimistic seat indicator never gets cleared.
+      return pending.promise.then(() => this.handleClaimSeat(socket, data));
+    }
+    const claim = this._serializeSeatMutation(key,
+      () => this._claimReservedSeat(socket, data, room, spectator));
+    const entry = { socketId: socket.id, promise: claim };
+    this._pendingSeatClaims.set(key, entry);
+    claim.finally(() => {
+      if (this._pendingSeatClaims.get(key) === entry) this._pendingSeatClaims.delete(key);
+    }).catch(() => {});
+    return claim;
+  }
+
+  async _seatBackendRequest(room, path, body) {
+    const backendUrl = room.backendBaseUrl || config.backend.url;
+    const headers = { 'Content-Type': 'application/json' };
+    if (config.backend.webhookSecret) headers['x-webhook-secret'] = config.backend.webhookSecret;
+    const response = await fetch(`${backendUrl.replace(/\/$/, '')}/api/webhooks/${path}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) throw new Error(`Seat reservation request failed: ${response.status}`);
+    return response.json();
+  }
+
+  async _fetchSeatReservation(room, playerId) {
+    const snapshot = await this._seatBackendRequest(room, 'room-fetch', { roomId: String(room.roomId) });
+    if (snapshot.exists !== true || snapshot.status !== 'open') return null;
+    return (snapshot.players || []).find((player) => String(player.playerId) === String(playerId)) || null;
+  }
+
+  async _releaseSeatReservation(room, playerId, reservationVersion) {
+    const key = `${room.roomId}:${playerId}`;
+    const rejection = { room, reservationVersion };
+    this._unresolvedSeatRejections.set(key, rejection);
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const result = await this._seatBackendRequest(room, 'room-seat-claim-rejected', {
+          roomId: String(room.roomId),
+          playerId: String(playerId),
+          reservationVersion,
+        });
+        if (result.success === true && result.isSpectator === true &&
+            this._unresolvedSeatRejections.get(key) === rejection) {
+          this._unresolvedSeatRejections.delete(key);
+        }
+        return result;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw lastError;
+  }
+
+  async _reconcileSeatRejection(room, playerId, reservation) {
+    const key = `${room.roomId}:${playerId}`;
+    const pending = this._unresolvedSeatRejections.get(key);
+    if (!pending) return reservation;
+    if (!reservation || reservation.isSpectator === true ||
+        reservation.reservationVersion !== pending.reservationVersion) {
+      // A fresh allocation has another generation; an old rejection cannot
+      // refund it because the API compares the version while holding its lock.
+      this._unresolvedSeatRejections.delete(key);
+      return reservation;
+    }
+    const released = await this._releaseSeatReservation(pending.room, playerId, pending.reservationVersion);
+    if (released.success !== true || released.isSpectator !== true) {
+      throw new Error('Previous seat rejection is not resolved');
+    }
+    return { ...reservation, isSpectator: true };
+  }
+
+  async _claimReservedSeat(socket, data, room, spectator) {
+    const playerId = spectator.spectatorId;
+    if (room.getPlayer(playerId)) {
+      return this._swapFail(socket, 'not_allowed', 'You already have a seat. Please reconnect.');
+    }
+    let reservation;
+    try {
+      reservation = await this._fetchSeatReservation(room, playerId);
+      reservation = await this._reconcileSeatRejection(room, playerId, reservation);
+    } catch (err) {
+      this._swapFail(socket, 'not_allowed', 'Could not verify your seat. Please retry.');
+      return;
+    }
+
+    const stillWatching = () => socket.connected !== false &&
+      this.gameService.getRoom(room.roomId) === room &&
+      this.spectatorSocketToRoom.get(socket.id) === room.roomId &&
+      this.roomSpectators.get(room.roomId)?.get(socket.id) === spectator &&
+      !this.gameService.getPlayerIdBySocket(socket.id) && !room.getPlayer(playerId);
+
+    // Another connection for this identity may already own a real runtime seat.
+    // Never compensate a stale request by refunding that winning player's stake.
+    if (room.getPlayer(playerId)) return;
+
+    const seat = Number(data.seat);
+    const hasReservation = reservation?.isSpectator === false &&
+      Number.isInteger(reservation.reservationVersion) && reservation.reservationVersion >= 0;
+    const canClaim = stillWatching() && !this._seatsLocked(room) &&
+      Number.isInteger(seat) && seat >= 0 && seat < room.maxPlayers &&
+      !room.getPlayerByIndex(seat) && !room.isFull();
+    if (hasReservation && canClaim) {
+      // No await between occupancy validation and the actual seat mutation.
+      return this._claimSeatNow(socket, data);
+    }
+
+    if (hasReservation) {
+      try {
+        const released = await this._releaseSeatReservation(room, playerId, reservation.reservationVersion);
+        // A newer REST attempt owns the reservation now, or the game started.
+        // The failed attempt must not demote the newer one in the client either.
+        if (released.success !== true || released.isSpectator !== true) {
+          if (stillWatching()) {
+            this._swapFail(socket, 'not_allowed', 'Your seat reservation changed. Please retry.');
+          }
+          return;
+        }
+      } catch (err) {
+        logger.warn(`[CLAIM_SEAT] Reservation release failed for ${playerId}: ${err.message}`);
+        if (stillWatching()) {
+          this._swapFail(socket, 'not_allowed', 'Could not release the seat reservation. Please retry.');
+        }
+        return;
+      }
+    }
+
+    if (stillWatching()) {
+      // Existing clients understand this spectator transition and clear their
+      // optimistic local seat. The reason distinguishes it from a host action.
+      socket.emit('kicked', { toSpectator: true, reason: 'seat_taken', timestamp: new Date().toISOString() });
+      this._swapFail(socket, 'seat_taken', 'That seat is taken. You are still a spectator.', seat);
+      this._broadcastSpectatorsChanged(room.roomId);
+    }
+  }
+
+  _claimSeatNow(socket, data = {}) {
     // A seated player is resolved via the socket→player binding; a spectator has
     // NO such binding (they live only in roomSpectators/spectatorSocketToRoom).
     // Resolve both so a spectator can claim a seat too.
@@ -6068,6 +6312,20 @@ class SocketHandlers {
    */
   handleLeaveSeat(socket) {
     const playerId = this.gameService.getPlayerIdBySocket(socket.id);
+    if (!playerId) {
+      const spectatorRoomId = this.spectatorSocketToRoom.get(socket.id);
+      const spectators = this.roomSpectators.get(spectatorRoomId);
+      const spectator = spectators?.get(socket.id);
+      const spectatorRoom = this.gameService.getRoom(spectatorRoomId);
+      if (spectator && spectatorRoom && !this._seatsLocked(spectatorRoom)) {
+        // REST stand-up can finish while claim_seat is awaiting its snapshot.
+        // Replace the registration to cancel that older intent, while keeping
+        // the viewer in the room. The pending claim releases only its version.
+        spectators.set(socket.id, { ...spectator });
+        this._broadcastSeatChanged(spectatorRoom);
+        return;
+      }
+    }
     const room = this.gameService.getPlayerRoom(playerId);
     if (!room) return this._swapFail(socket, 'not_allowed', 'Room not found');
     if (this._seatsLocked(room)) {
@@ -6358,19 +6616,27 @@ class SocketHandlers {
       `[GET_GAME_STATE] ✓ Sending game state to ${playerId}. Current turn: ${room.currentTurn}, Phase: playing, Deck: ${room.deck?.count || 0}, cardsDealt=${room.cardsDealt}`
     );
 
-    // Send game_started first
-    socket.emit(SocketEvents.GAME_STARTED, {
-      ...this._serializeRoomGameSettings(room),
-      players: room.getPlayers().map((p) => this._serializePlayer(p)),
-      yourPlayerIndex: player.playerIndex,
-      currentPlayerIndex: this._announcedTurnIndex(room),
-      ruleset: room.ruleset,
-      professionalWellMode: room.professionalWellMode,
-      hostId: room.hostPlayerId || null,
-      turnTimeLimitSeconds: room.turnTimeLimit,
-      timestamp: new Date().toISOString(),
-      cardsDealt: room.cardsDealt || false,
-    });
+    // A reconnect asks for state in the lobby too. Seated mobile clients enter
+    // the board on GAME_STARTED, even with cardsDealt=false, so sending that
+    // event for WAITING rooms opens an empty board before the host can start.
+    // Keep the full snapshot below for the client's connection watchdog, and
+    // replay the lobby event it actually consumes for seat/start readiness.
+    if (room.status === GameRoomStatus.WAITING && !room.cardsDealt) {
+      socket.emit(SocketEvents.PLAYER_JOINED, this._lobbyPlayersPayload(room, player));
+    } else {
+      socket.emit(SocketEvents.GAME_STARTED, {
+        ...this._serializeRoomGameSettings(room),
+        players: room.getPlayers().map((p) => this._serializePlayer(p)),
+        yourPlayerIndex: player.playerIndex,
+        currentPlayerIndex: this._announcedTurnIndex(room),
+        ruleset: room.ruleset,
+        professionalWellMode: room.professionalWellMode,
+        hostId: room.hostPlayerId || null,
+        turnTimeLimitSeconds: room.turnTimeLimit,
+        timestamp: new Date().toISOString(),
+        cardsDealt: room.cardsDealt || false,
+      });
+    }
 
     // Then send current game state
     const yourHand = room.playerHands.get(playerId) || [];
@@ -6792,17 +7058,10 @@ class SocketHandlers {
       `[DRAW_CARD] Player ${playerId} (index: ${player?.playerIndex}) drawing from ${fromDeck ? 'deck' : 'pile'} in room ${room.roomId}`
     );
 
-    // Stock exhausted (standard Brazilia): the deck is never refilled. The round
-    // ends here when no move remains — deck AND pile both empty, or this player
-    // is move-locked (deck dead + pile take blocked by the squeeze guard, the
-    // deadlock where draw and pile-take were BOTH rejected and the game froze).
-    // Otherwise an empty-deck draw is rejected below (validateDrawCard) and the
-    // player takes the pile instead.
-    // Turn check FIRST. _deckOutTerminal can end the round and promote an untaken
-    // pozzetto, and it used to run before handleDrawCard's own validation — so an
-    // out-of-turn draw from any seated socket could destroy a pot that was still
-    // in play. validateDrawCard re-checks the turn below; this only moves the
-    // check ahead of the destructive branch.
+    // Validate the acting seat before resolving an empty stock. A manual draw
+    // promotes one untaken pozzetto, exactly as timeout auto-draw does, or ends
+    // the round when no stock remains. Rejected repeat draws must not consume a
+    // second well; _deckOutTerminal also checks hasDrawnCard.
     const drawTurnCheck = GameValidator.validateTurn(room, playerId);
     if (!drawTurnCheck.isValid) {
       logger.warn(
