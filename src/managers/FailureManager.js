@@ -218,6 +218,7 @@ class FailureManager extends EventEmitter {
         // room still routes its webhooks (room-closed / player-left / game-result
         // settlement) to the CORRECT backend after a restart, not the default.
         backendBaseUrl: room.backendBaseUrl || null,
+        seatReservationProtocol: room.seatReservationProtocol || 0,
         hasDrawnCard: room.hasDrawnCard,
         turnHadManualAction: room.turnHadManualAction,
         drawnCardThisTurnRestriction: Array.from(room.drawnCardThisTurnRestriction || []),
@@ -1093,6 +1094,7 @@ class FailureManager extends EventEmitter {
     room.lastBatidaType = state.lastBatidaType || null;
     room.lastRoundEndPayload = state.lastRoundEndPayload || null;
     room.backendBaseUrl = state.backendBaseUrl || room.backendBaseUrl || null;
+    room.seatReservationProtocol = state.seatReservationProtocol === 1 ? 1 : 0;
 
     (state.players || []).forEach((rawPlayer) => {
       const player = new PlayerSession({

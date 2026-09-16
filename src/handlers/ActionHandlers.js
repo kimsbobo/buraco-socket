@@ -1259,73 +1259,19 @@ class ActionHandlers {
   }
 
   /**
-   * Deck-out terminal check for the player whose turn it is. Once the stock is
-   * permanently dead (empty and no untaken pozzetto to promote), taking the
-   * discard pile is the ONLY way the hand can continue. If even that take is
-   * rule-blocked for this player (the single-card squeeze guard), no legal move
-   * exists at all — previously the table deadlocked here: the draw was rejected,
-   * the pile take was rejected, and the turn timer just skipped seat after seat
-   * forever ("stuck game"). End the round no-batida instead.
-   * Returns { roundEnded } when the round was ended (either because deck+pile
-   * are both dead, or because this player is move-locked), else null.
+   * Resolve an empty stock before a manual draw, using the same promotion rule
+   * as timeout and bot draws. Taking the discard pile is a separate action and
+   * still leaves an untaken pozzetto available to claim by emptying the hand.
    * @param {GameRoom} room
    * @param {string} playerId
    * @returns {Object|null}
    */
   static _deckOutTerminal(room, playerId) {
-    if (!room.deck || room.deck.count > 0) return null;
-
-    // The stock is dead. An untaken well is NO LONGER a refill of first resort
-    // (product decision 2026-08-27): "kalo deck pile 0, trus lu bisa meld semua
-    // pairs yang di tangan lu, itu pozetto bisa diambil ketimbang jadi deck".
-    //
-    // The promotion used to fire here, on the DRAW TAP — which meant the player
-    // whose turn it was when the stock ran out never got a chance to reach the
-    // well at all: tapping draw consumed it before they could play. Deferring it
-    // leaves the well on the table, where emptying your hand still collects it
-    // through the ordinary _autoTakeDeadIfNeeded path.
-    //
-    // No solver is needed to decide whether this hand "can meld everything" —
-    // the player decides by doing it. All this has to do is not destroy the well
-    // while they still have a legal way to continue without it.
-    const wellOnTable = (room.deadPiles || []).some(
-      (p) => Array.isArray(p) && p.length > 0
-    );
-    const pileIsAContinuation =
-      (room.discardPile || []).length > 0 &&
-      !this._pileTakeBlockedBySqueeze(room, playerId);
-
-    if (wellOnTable && pileIsAContinuation) {
-      // validateDrawCard rejects the empty-stock draw ("Deck is empty") and the
-      // player takes the pile instead. Nothing is consumed, and because the pile
-      // IS a legal move nobody can be stuck — which is the whole safety argument
-      // for deferring.
-      return null;
-    }
-
-    // No continuation without it: promote the well (or, with nothing left to
-    // promote, end the round no-batida) exactly as before.
-    const refill = this._refillStockOrEndRound(room);
-    if (refill) return refill;
-
-    // THE STOCK IS ALIVE AGAIN if that promoted a well into it, and a live stock
-    // is not a deck-out: the player simply draws. This guard used to sit here and
-    // I hoisted it to the top of the method by mistake when the deferral above
-    // was added, leaving nothing between the promotion and the squeeze test.
-    //
-    // What that cost: `_pileTakeBlockedBySqueeze` reads `deck.count > 0 || any
-    // well non-empty`, so it was true BEFORE the promotion (because wells
-    // existed) and true again AFTER it (because the deck now holds 11) — for a
-    // different reason each time. The round therefore ended on the very tap that
-    // refilled it, with the SECOND well abandoned on the table: 11 cards
-    // credited to nobody, never promoted, and both sides charged -100 for
-    // "never taking a well" they were never given the chance to take.
-    if (!room.deck || room.deck.count > 0) return null;
-
-    if (this._pileTakeBlockedBySqueeze(room, playerId)) {
-      return { roundEnded: this._finalizeRoundNoBatida(room) };
-    }
-    return null;
+    if (!room.deck || room.deck.count > 0 || room.hasDrawnCard) return null;
+    // The socket checks this before calling us too; retain the guard here so
+    // any draw caller cannot consume a well on behalf of the wrong seat.
+    if (!GameValidator.validateTurn(room, playerId).isValid) return null;
+    return this._refillStockOrEndRound(room);
   }
 
   /**
