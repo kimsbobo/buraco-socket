@@ -127,6 +127,14 @@ class GameService {
     this.socketToPlayer.set(socketId, player.playerId);
   }
 
+  canReleaseWaitingSeat(room, playerId, proof) {
+    const player = room?.getPlayer(playerId);
+    return !!player && room.status === GameRoomStatus.WAITING && !room.awaitingNextRound &&
+      !room._pendingBackendStart && String(room.hostPlayerId) !== String(playerId) &&
+      proof?.room === room && proof.player === player && proof.socketId === player.socketId &&
+      proof.reservationVersion === player.apiSeatReservationVersion;
+  }
+
   /**
    * Join a player to a room
    * @param {string} roomId
@@ -135,34 +143,49 @@ class GameService {
    * @param {string} socketId
    * @returns {Object}
    */
-  joinRoom(roomId, playerId, playerName, socketId, avatarUrl = null) {
+  joinRoom(roomId, playerId, playerName, socketId, avatarUrl = null, preferredPlayerIndex = null, releasedSeatProof = null) {
     const normalizedRoomId = this._normalizeRoomId(roomId);
     const room = this.getRoom(normalizedRoomId);
     if (!room) {
       return { success: false, error: 'Room not found' };
     }
+    let roomToLeave = null;
+    let previousRoom = null;
+    let previousPlayer = null;
 
     // Check if player is already in a room (handle reconnection)
     if (this.playerToRoom.has(playerId)) {
       const currentRoomId = this.playerToRoom.get(playerId);
 
       if (currentRoomId !== normalizedRoomId) {
-        // Player is in a different room - just leave the old one and join the new one
+        const currentRoom = this.getRoom(currentRoomId);
+        const currentPlayer = currentRoom?.getPlayer(playerId);
+        const releasedWaitingSeat = this.canReleaseWaitingSeat(currentRoom, playerId, releasedSeatProof);
+        if (currentRoom?.getPlayer(playerId) &&
+            (currentRoom.isInProgress() || currentRoom.awaitingNextRound || currentRoom._pendingBackendStart ||
+             (currentRoom.status === GameRoomStatus.WAITING && (currentRoom.backendManaged || room.backendManaged) && !releasedWaitingSeat))) {
+          return { success: false, error: 'Player is already in another active room' };
+        }
+        // Keep standalone room switching compatible, but validate/admit the
+        // destination before dropping the old seat. Live matches never switch
+        // through this incidental join path: leaving one requires a forfeit.
+        roomToLeave = currentRoomId;
+        previousRoom = currentRoom;
+        previousPlayer = currentPlayer;
         logger.info(
-          `Player ${playerId} switching from room ${currentRoomId} to room ${normalizedRoomId}. Auto-leaving old room.`
+          `Player ${playerId} requesting switch from room ${currentRoomId} to room ${normalizedRoomId}.`
         );
         this._logRoomLifecycle('player_switch_room', {
           roomId: normalizedRoomId,
           previousRoomId: currentRoomId,
           playerId,
         });
-        this.leaveRoom(playerId);
-        // Continue to join the new room...
       } else {
         // Player is reconnecting to the same room
         // Allow reconnection even if room is full
         const existingPlayer = room.getPlayer(playerId);
         if (existingPlayer) {
+          room.restoreWaitingHostSeat();
           this._rebindSeatSocket(existingPlayer, socketId);
           if (avatarUrl) existingPlayer.avatarUrl = avatarUrl;
           logger.info(`Player ${playerId} reconnected to room ${normalizedRoomId}`);
@@ -185,6 +208,8 @@ class GameService {
     // This can happen if state became inconsistent or during rapid rejoin attempts
     const existingPlayerInRoom = room.getPlayer(playerId);
     if (existingPlayerInRoom) {
+      if (roomToLeave) this.leaveRoom(playerId);
+      room.restoreWaitingHostSeat();
       this._rebindSeatSocket(existingPlayerInRoom, socketId);
       if (avatarUrl) existingPlayerInRoom.avatarUrl = avatarUrl;
       this.playerToRoom.set(playerId, normalizedRoomId); // Restore mapping
@@ -199,19 +224,44 @@ class GameService {
         reconnected: true,
         room,
         player: existingPlayerInRoom,
+        previousRoom,
+        previousPlayer,
       };
     }
 
+    if (room.status !== GameRoomStatus.WAITING || room.awaitingNextRound) {
+      return { success: false, error: 'Room is not open for new seats' };
+    }
     if (room.isFull()) {
       return { success: false, error: 'Room is full' };
     }
+    if (room._pendingBackendStart) {
+      return { success: false, error: 'Room start is pending' };
+    }
 
-    // Create player session
-    // Find first available player index
+    const fixedHostSeats = room.status === GameRoomStatus.WAITING && !room.awaitingNextRound;
+    const isHost = fixedHostSeats && room.hostPlayerId != null && String(room.hostPlayerId) === String(playerId);
+    const reserveHostSeat = fixedHostSeats && room.hostPlayerId != null;
+    const hasPreferredSeat = preferredPlayerIndex != null;
+    if (hasPreferredSeat && (!Number.isInteger(preferredPlayerIndex) || preferredPlayerIndex < 0 ||
+        preferredPlayerIndex >= room.maxPlayers || (isHost && preferredPlayerIndex !== 0) ||
+        (reserveHostSeat && !isHost && preferredPlayerIndex === 0))) {
+      return { success: false, error: 'Invalid reserved seat' };
+    }
+    const hostPresent = room.getPlayers().some((p) => String(p.playerId) === String(room.hostPlayerId));
+    if (reserveHostSeat && !isHost && !hostPresent && room.players.size >= room.maxPlayers - 1) {
+      return { success: false, error: 'No available seat for player' };
+    }
+    // Repair only an admissible join/reconnect: a rejected request must not
+    // silently move players without its handler publishing a successful roster.
+    const rosterChanged = room.restoreWaitingHostSeat();
     const usedIndices = room.getPlayers().map((p) => p.playerIndex);
-    let playerIndex = 0;
-    while (usedIndices.includes(playerIndex)) {
+    let playerIndex = hasPreferredSeat ? preferredPlayerIndex : isHost || !reserveHostSeat ? 0 : 1;
+    while (!hasPreferredSeat && !isHost && playerIndex < room.maxPlayers && usedIndices.includes(playerIndex)) {
       playerIndex++;
+    }
+    if (playerIndex >= room.maxPlayers || usedIndices.includes(playerIndex)) {
+      return { success: false, error: 'No available seat for player', room, rosterChanged };
     }
 
     const session = new PlayerSession({
@@ -226,6 +276,7 @@ class GameService {
     if (!room.addPlayer(session)) {
       return { success: false, error: 'Failed to add player to room' };
     }
+    if (roomToLeave) this.leaveRoom(playerId);
 
     // Fallback host ONLY for a room the backend does not own. A backend-managed
     // room's host is authoritative from sync-room (wlive host_user_id); a joiner
@@ -254,6 +305,8 @@ class GameService {
       room,
       player: session,
       gameStarted: false,
+      previousRoom,
+      previousPlayer,
     };
   }
 
@@ -275,7 +328,7 @@ class GameService {
       return { success: false, error: 'Room not found' };
     }
 
-    if (room.status !== GameRoomStatus.WAITING) {
+    if (room.status !== GameRoomStatus.WAITING || room._pendingBackendStart) {
       return { success: false, error: 'Cannot add bot after game has started' };
     }
 
@@ -288,11 +341,20 @@ class GameService {
       return { success: false, error: 'Bot already exists in a room' };
     }
 
+    // A backend may explicitly create a bot-only table without a human host.
+    // Its first bot still owns zero; a known human/bot host reserves that chair.
+    const isHost = room.hostPlayerId != null && String(room.hostPlayerId) === botId;
+    const firstSeat = room.hostPlayerId != null && !isHost ? 1 : 0;
+    const hostPresent = room.getPlayers().some((p) => String(p.playerId) === String(room.hostPlayerId));
+    if (firstSeat === 1 && !hostPresent && room.players.size >= room.maxPlayers - 1) {
+      return { success: false, error: 'No available seat for bot' };
+    }
+    room.restoreWaitingHostSeat();
     const usedIndices = room.getPlayers().map((p) => p.playerIndex);
-    let playerIndex = Number.isInteger(options.playerIndex) ? options.playerIndex : 0;
-    if (playerIndex < 0 || playerIndex >= room.maxPlayers || usedIndices.includes(playerIndex)) {
-      playerIndex = 0;
-      while (usedIndices.includes(playerIndex)) {
+    let playerIndex = isHost ? 0 : Number.isInteger(options.playerIndex) ? options.playerIndex : firstSeat;
+    if (playerIndex < firstSeat || playerIndex >= room.maxPlayers || usedIndices.includes(playerIndex)) {
+      playerIndex = firstSeat;
+      while (playerIndex < room.maxPlayers && usedIndices.includes(playerIndex)) {
         playerIndex++;
       }
     }
@@ -314,7 +376,7 @@ class GameService {
       return { success: false, error: 'Failed to add bot to room' };
     }
 
-    if (!room.hostPlayerId) {
+    if (!room.hostPlayerId && playerIndex === 0) {
       room.hostPlayerId = botId;
     }
 
@@ -410,7 +472,7 @@ class GameService {
     // Clean up empty rooms. Route through _deleteRoom so per-room timers are
     // cleared AND the backend is notified (onRoomDeleted), instead of a bare
     // rooms.delete that leaked both.
-    if (room.players.size === 0) {
+    if (room.players.size === 0 && !(room.backendManaged && room.status === GameRoomStatus.WAITING && room.hostPlayerId != null)) {
       this._logRoomLifecycle('room_deleted_empty', { roomId });
       // Notify any lingering spectators before teardown (see host-left path above).
       this._notifyRoomClosing(roomId, 'closed');
