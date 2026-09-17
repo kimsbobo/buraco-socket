@@ -386,11 +386,14 @@ class GameRoom {
   }
 
   /**
-   * Check if room can start (enough players)
+   * Check the full configured roster, including unique, valid seat indices.
    * @returns {boolean}
    */
   canStart() {
-    return this.players.size === this.maxPlayers;
+    if (![2, 4].includes(this.maxPlayers) || this.players.size !== this.maxPlayers) return false;
+    const seats = this.getPlayers().map((player) => player.playerIndex);
+    return new Set(seats).size === this.maxPlayers &&
+      seats.every((seat) => Number.isInteger(seat) && seat >= 0 && seat < this.maxPlayers);
   }
 
   /**
@@ -481,16 +484,13 @@ class GameRoom {
 
   /**
    * Start the game
-   * @param {boolean} force - Force start even if room is not full (requires >= 2 players)
+   * Legacy callers may still pass a force argument; it never bypasses the
+   * configured roster requirement or changes a 2v2 table into another mode.
    */
-  startGame(force = false) {
-    if (!force && !this.canStart()) return false;
-    if (force && this.players.size < 2) return false;
-
-    // If forced start, update maxPlayers to prevent more joins
-    if (force) {
-      this.maxPlayers = this.players.size;
-    }
+  startGame() {
+    // A short 2v2 table can have seats [0, 1, 3]. Shrinking its capacity to 3
+    // would rotate through missing seat 2 and stop the timer permanently.
+    if (!this.canStart()) return false;
 
     this.status = GameRoomStatus.IN_PROGRESS;
     this.gameStartedAt = new Date();

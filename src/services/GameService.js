@@ -186,6 +186,7 @@ class GameService {
     const existingPlayerInRoom = room.getPlayer(playerId);
     if (existingPlayerInRoom) {
       this._rebindSeatSocket(existingPlayerInRoom, socketId);
+      if (avatarUrl) existingPlayerInRoom.avatarUrl = avatarUrl;
       this.playerToRoom.set(playerId, normalizedRoomId); // Restore mapping
       logger.info(`Player ${playerId} reconnected to room ${normalizedRoomId} (restored mapping)`);
       this._logRoomLifecycle('player_reconnected_mapping_restored', {

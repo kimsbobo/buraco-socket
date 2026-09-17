@@ -2769,7 +2769,7 @@ class SocketHandlers {
     }
 
     // Check if room is full
-    if (room.players.size < room.maxPlayers) {
+    if (!room.canStart()) {
       socket.emit(
         SocketEvents.ERROR,
         ErrorHandler.createErrorResponse(
@@ -2990,6 +2990,21 @@ class SocketHandlers {
         this._sendInitialGameState(room);
       }
       return { success: true, alreadyStarted: true, cardsDealt: room.cardsDealt || false };
+    }
+
+    // The API's occupancy may lag a lobby disconnect/grace expiry. Validate
+    // actual seats before dealing, just as the socket start path does.
+    if (!room.canStart()) {
+      this._logRoomLifecycle('start_rejected_incomplete_roster', {
+        roomId: normalizedRoomId,
+        playerCount: room.players.size,
+        maxPlayers: room.maxPlayers,
+        seats: room.getPlayers().map((player) => player.playerIndex),
+      });
+      return {
+        success: false,
+        error: `Cannot start game: Room needs ${room.maxPlayers} valid occupied seats (${room.players.size} players)`,
+      };
     }
 
     this._applyTurnTimeLimit(room, options);
@@ -5721,6 +5736,8 @@ class SocketHandlers {
       playerIndex: seat,
       socketId: socket.id,
       isBot: false,
+      // Sitting down keeps the profile already announced while watching.
+      avatarUrl: data.avatarUrl || data.photoUrl || data.avatar || spectator.avatarUrl || null,
     });
     if (!room.addPlayer(session)) {
       return this._swapFail(socket, 'seat_taken', 'That seat is taken', seat);
@@ -7824,10 +7841,9 @@ class SocketHandlers {
       // Ownership is async — re-check the state we validated before awaiting.
       if (!room.awaitingNextRound || room.isInProgress()) return;
     }
-    // Seat integrity. startGame(force) rewrites maxPlayers = players.size, so
-    // force-starting a short table would silently turn a 2v2 into a 3-hander with
-    // broken even/odd teaming — and cumulativeTeamScores is keyed on exactly that.
-    // Require a FULL table, not merely >= 2.
+    // Seat integrity: never deal a short table or change even/odd team identity.
+    // The model enforces the same roster invariant; detect it here first so the
+    // next-round abort carries the specific reason.
     //
     // No bounded retry before this abort, deliberately. The shortfalls that made
     // it fire on HEALTHY matches were all writes that should never have happened
@@ -7841,7 +7857,7 @@ class SocketHandlers {
     // this timer. A retry would therefore delay the same outcome while adding a
     // second live deadline racing the room-deletion grace and a manual start —
     // new failure modes on a money path, for no recoverable case.
-    if (room.players.size < 2 || room.players.size !== room.maxPlayers) {
+    if (!room.canStart()) {
       this._abortNextRound(room, 'seat_missing');
       return;
     }
