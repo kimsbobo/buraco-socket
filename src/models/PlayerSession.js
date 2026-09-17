@@ -22,6 +22,8 @@ class PlayerSession {
     this.status = 'connected';
     this.isBot = isBot === true;
     this.botLevel = botLevel;
+    // Server-only proof of the API seat allocation admitted by join/claim.
+    this.apiSeatReservationVersion = null;
   }
 
   /**

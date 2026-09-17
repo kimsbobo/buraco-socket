@@ -59,6 +59,8 @@ class GameRoom {
     // from ever reassigning the host away from what the backend synced.
     this.backendManaged = false;
     this.seatReservationProtocol = 0;
+    this.seatConnectionProtocol = 0;
+    this.seatLayoutProtocol = 0;
     this.ownerControllerPlayerId = null;
     this.ownerControllerSocketId = null;
     this.replacedHostBotId = null;
@@ -470,6 +472,34 @@ class GameRoom {
    */
   getPlayerByIndex(playerIndex) {
     return this.getPlayers().find((p) => p.playerIndex === playerIndex);
+  }
+
+  /**
+   * Repair a pre-game host displaced by an older first-join/switch-team path.
+   * Never reseat a running match: player indices also identify its teams/hands.
+   * @returns {boolean} whether any seated player moved
+   */
+  restoreWaitingHostSeat() {
+    if (this.status !== GameRoomStatus.WAITING || this.awaitingNextRound || this._pendingBackendStart ||
+        this.hostPlayerId == null) return false;
+    const host = this.getPlayers().find((p) => String(p.playerId) === String(this.hostPlayerId));
+    const occupant = this.getPlayerByIndex(0);
+    if (host) {
+      this.hostPlayerIndex = 0;
+      if (host.playerIndex === 0) return false;
+      if (occupant) occupant.playerIndex = host.playerIndex;
+      host.playerIndex = 0;
+      return true;
+    }
+    if (!occupant) return false;
+    // The host has not connected yet. Keep their chair free without dropping
+    // or duplicating the guest who was incorrectly assigned it.
+    for (let seat = 1; seat < this.maxPlayers; seat += 1) {
+      if (this.getPlayerByIndex(seat)) continue;
+      occupant.playerIndex = seat;
+      return true;
+    }
+    return false;
   }
 
   /**

@@ -219,6 +219,10 @@ class FailureManager extends EventEmitter {
         // settlement) to the CORRECT backend after a restart, not the default.
         backendBaseUrl: room.backendBaseUrl || null,
         seatReservationProtocol: room.seatReservationProtocol || 0,
+        seatConnectionProtocol: room.seatConnectionProtocol || 0,
+        seatLayoutProtocol: room.seatLayoutProtocol || 0,
+        startAttemptProtocol: room.startAttemptProtocol || 0,
+        startAttemptId: room.startAttemptId || null,
         hasDrawnCard: room.hasDrawnCard,
         turnHadManualAction: room.turnHadManualAction,
         drawnCardThisTurnRestriction: Array.from(room.drawnCardThisTurnRestriction || []),
@@ -233,6 +237,7 @@ class FailureManager extends EventEmitter {
         turnTimeRemaining: room.getTurnTimeRemaining ? room.getTurnTimeRemaining() : room.turnTimeRemaining,
         
         players: room.getPlayers().map(p => ({
+          apiSeatReservationVersion: p.apiSeatReservationVersion ?? null,
           playerId: p.playerId,
           playerName: p.playerName,
           playerIndex: p.playerIndex,
@@ -1049,7 +1054,7 @@ class FailureManager extends EventEmitter {
     const room = new GameRoom({ roomId: state.roomId, maxPlayers: state.maxPlayers || 2 });
 
     room.name = state.name || room.name;
-    room.hostPlayerId = state.hostPlayerId;
+    room.hostPlayerId = state.hostPlayerId == null ? null : String(state.hostPlayerId);
     room.hostPlayerIndex = state.hostPlayerIndex;
     room.status = state.status;
     room.currentTurn = state.currentTurn;
@@ -1095,6 +1100,10 @@ class FailureManager extends EventEmitter {
     room.lastRoundEndPayload = state.lastRoundEndPayload || null;
     room.backendBaseUrl = state.backendBaseUrl || room.backendBaseUrl || null;
     room.seatReservationProtocol = state.seatReservationProtocol === 1 ? 1 : 0;
+    room.seatConnectionProtocol = state.seatConnectionProtocol === 1 ? 1 : 0;
+    room.seatLayoutProtocol = state.seatLayoutProtocol === 1 ? 1 : 0;
+    room.startAttemptProtocol = state.startAttemptProtocol === 1 ? 1 : 0;
+    room.startAttemptId = state.startAttemptId || null;
 
     (state.players || []).forEach((rawPlayer) => {
       const player = new PlayerSession({
@@ -1107,6 +1116,8 @@ class FailureManager extends EventEmitter {
       player.isConnected = rawPlayer.isConnected ?? player.status === 'connected';
       player.avatarUrl = rawPlayer.avatarUrl || null;
       player.isBot = Boolean(rawPlayer.isBot);
+      player.apiSeatReservationVersion = Number.isInteger(rawPlayer.apiSeatReservationVersion)
+        ? rawPlayer.apiSeatReservationVersion : null;
       player.botDifficulty = rawPlayer.botDifficulty;
       player.connectedAt = rawPlayer.connectedAt ? new Date(rawPlayer.connectedAt) : player.connectedAt;
       player.joinedAt = rawPlayer.joinedAt ? new Date(rawPlayer.joinedAt) : player.joinedAt;

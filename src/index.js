@@ -196,61 +196,27 @@ class BraziliaServer {
           return;
         }
 
-        if (req.method === 'POST' && req.url.startsWith('/webhooks/start-game')) {
-          let body = '';
-          req.on('data', (chunk) => {
-            body += chunk;
-          });
-          req.on('end', () => {
+        if (req.method === 'POST' && ['/webhooks/start-game', '/webhooks/abort-start'].includes(req.url.split('?')[0])) {
+          (async () => {
             try {
-              const secret = req.headers['x-webhook-secret'];
-              if (
-                this.config.security.webhookSecret &&
-                secret !== this.config.security.webhookSecret
-              ) {
-                logger.warn('[WEBHOOK] Unauthorized start-game webhook', {
-                  source: 'webhook',
-                  event: 'start_game',
-                  requestId,
-                });
-                res.statusCode = 401;
-                res.setHeader('Content-Type', 'application/json');
-                res.end(JSON.stringify({ error: 'Unauthorized' }));
+              if (this.config.security.webhookSecret && req.headers['x-webhook-secret'] !== this.config.security.webhookSecret) {
+                sendJson(res, 401, { success: false, error: 'Unauthorized' });
                 return;
               }
-              const data = JSON.parse(body || '{}');
-              const roomId = data.roomId;
-              if (!roomId) {
-                res.statusCode = 400;
-                res.setHeader('Content-Type', 'application/json');
-                res.end(JSON.stringify({ error: 'roomId required' }));
+              const data = await readJsonBody(req);
+              if (!data.roomId) {
+                sendJson(res, 400, { success: false, error: 'roomId required' });
                 return;
               }
-
-              logger.info('[WEBHOOK] start-game received', {
-                source: 'webhook',
-                event: 'start_game',
-                roomId: String(roomId),
-                turnTimeLimitSeconds: data.turnTimeLimitSeconds ?? data.turnTimeLimit ?? null,
-                requestId,
-              });
-
-              const result = this.socketHandlers.triggerStartGame(roomId, data);
-              res.statusCode = result.success ? 200 : 400;
-              res.setHeader('Content-Type', 'application/json');
-              res.end(JSON.stringify(result));
-            } catch (e) {
-              logger.error('[WEBHOOK] start-game failed', {
-                source: 'webhook',
-                event: 'start_game',
-                requestId,
-                error: e.message,
-              });
-              res.statusCode = 500;
-              res.setHeader('Content-Type', 'application/json');
-              res.end(JSON.stringify({ error: 'Internal Server Error' }));
+              const result = req.url.split('?')[0] === '/webhooks/abort-start'
+                ? await this.socketHandlers.abortStartFromBackend(data)
+                : await this.socketHandlers.triggerStartGame(data.roomId, data);
+              sendJson(res, result.success ? 200 : 400, result);
+            } catch (error) {
+              logger.error('[WEBHOOK] start transition failed', { requestId, error: error.message });
+              sendJson(res, 500, { success: false, error: 'Internal Server Error' });
             }
-          });
+          })();
           return;
         }
 

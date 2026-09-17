@@ -12,6 +12,8 @@ const GameValidator = require('../validators/GameValidator');
 const { Card } = require('../models/Deck');
 const PlayerSession = require('../models/PlayerSession');
 const metrics = require('../observability/metrics');
+const { randomBytes } = require('crypto');
+const { startBackendAttempt, abortBackendAttempt } = require('../services/BackendStartAttempt');
 
 const ROOM_OWNER_ACTION_EVENT = '__brazilia_room_owner_action';
 
@@ -175,6 +177,7 @@ class SocketHandlers {
     // (A1): a WAITING-phase disconnect schedules the real leave/teardown here and
     // a reconnect within the grace window cancels it.
     this._waitingGraceTimers = new Map();
+    this._pendingBackendLeaves = new Map();
 
     // roomId -> { reason, backendBaseUrl }. Stashed just before a room is deleted
     // so the onRoomDeleted → _notifyBackendRoomClosed hook (which only receives a
@@ -257,7 +260,7 @@ class SocketHandlers {
       // lobby occupancy reflects reality. `inProgress` tells the backend NOT to
       // close the room (bots — and possibly other humans — are still playing).
       this.failureManager.notifyBackendSeatVacated = (roomId, playerId, room) => {
-        this._notifyBackendPlayerLeft(roomId, playerId, true);
+        this._notifyBackendPlayerLeft(roomId, playerId, true, room?.getPlayer(playerId), room);
         this._notifyBackendPlayerCount(roomId, room?.players?.size ?? 0);
       };
     }
@@ -669,6 +672,10 @@ class SocketHandlers {
 
   _emitPartnerWebhook(eventName, payload = {}) {
     if (!this.partnerWebhookRelay) return;
+    if (eventName === 'game.started') {
+      const room = this.gameService.getRoom(payload.roomId);
+      if (room?.startAttemptId) payload = { ...payload, attemptId: room.startAttemptId };
+    }
     this.partnerWebhookRelay.dispatch(eventName, payload);
   }
 
@@ -737,7 +744,8 @@ class SocketHandlers {
     if (!room) {
       room = this._findRoomControlledBySocket(socket.id);
     }
-    const isHostPlayer = Boolean(playerId && room?.hostPlayerId === playerId);
+    const isHostPlayer = Boolean(playerId && String(room?.hostPlayerId) === String(playerId) &&
+      this._socketOwnsSeat(socket, room?.getPlayer(playerId)));
     const isOwnerController = Boolean(room?.ownerControllerSocketId === socket.id);
     return { playerId, room, isHostPlayer, isOwnerController };
   }
@@ -1246,6 +1254,14 @@ class SocketHandlers {
       SocketEvents.PLAYER_JOINED,
       this._lobbyPlayersPayload(room, representative)
     );
+    this._queueSeatLayoutSync(room);
+    this._persistLobbyRoster(room);
+  }
+
+  _persistLobbyRoster(room) {
+    if (room?.status !== GameRoomStatus.WAITING || this.gameService.getRoom(room.roomId) !== room) return;
+    if (this._ownershipEnabled() && !this.ownedRoomIds.has(String(room.roomId))) return;
+    this._persistRoomState(room);
   }
 
   _lobbyPlayersPayload(room, representative = null) {
@@ -1998,14 +2014,18 @@ class SocketHandlers {
   }
 
   handleJoinRoom(socket, data) {
+    const joinEpoch = (socket._roomJoinEpoch || 0) + 1;
+    socket._roomJoinEpoch = joinEpoch;
     if (data?.isSpectator || data?.roomId == null || data?.playerId == null) {
-      return this._handleJoinRoom(socket, data);
+      return this._handleJoinRoom(socket, data, joinEpoch);
     }
-    return this._serializeSeatMutation(`${data.roomId}:${data.playerId}`,
-      () => this._handleJoinRoom(socket, data));
+    const key = `${data.roomId}:${data.playerId}`;
+    return this._serializeSeatMutation(key, () => this._handleJoinRoom(socket, data, joinEpoch, key));
   }
 
-  async _handleJoinRoom(socket, data) {
+  async _handleJoinRoom(socket, data, joinEpoch = socket._roomJoinEpoch, seatMutationKey = null) {
+    const joinIsCurrent = () => socket.connected !== false && socket._roomJoinEpoch === joinEpoch;
+    if (!joinIsCurrent()) return;
     const { playerId, playerName, roomId, isSpectator = false } = data;
     const avatarUrl = data?.avatarUrl || data?.photoUrl || data?.avatar || null;
     const normalizedRoomId = roomId === null || roomId === undefined ? roomId : String(roomId);
@@ -2060,8 +2080,76 @@ class SocketHandlers {
         return;
       }
 
+      const spectatorIdentity = socket.data?.authenticated && socket.data.userId != null
+        ? String(socket.data.userId) : playerId;
+      if (room.seatConnectionProtocol === 1 && (!socket.data?.authenticated || socket.data.userId == null)) {
+        socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Authentication required to join this room'));
+        return;
+      }
+      if (room.seatConnectionProtocol !== 1 && spectatorIdentity != null && room.getPlayer(spectatorIdentity)) {
+        // The transport may remember spectator intent from a REST stand-up
+        // whose socket leave was lost. Let verified normal admission reconcile
+        // that existing seat; never register one identity in both roles.
+        const key = `${room.roomId}:${spectatorIdentity}`;
+        const resume = () => this._handleJoinRoom(socket, { ...data, playerId: spectatorIdentity, isSpectator: false }, joinEpoch, key);
+        return seatMutationKey === key ? resume() : this._serializeSeatMutation(key, resume);
+      }
+      if (room.seatConnectionProtocol === 1) {
+        const member = room.getPlayer(spectatorIdentity);
+        const memberSocket = member?.socketId;
+        const memberVersion = member?.apiSeatReservationVersion;
+        let participant;
+        try {
+          participant = await this._seatBackendRequest(room, 'room-participant', {
+            roomId: String(room.roomId), playerId: String(spectatorIdentity),
+          });
+        } catch (err) {
+          if (joinIsCurrent()) socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Could not verify room access. Please retry.'));
+          return;
+        }
+        if (!joinIsCurrent() || this.gameService.getRoom(room.roomId) !== room) return;
+        if (participant.authorized !== true || String(participant.playerId) !== String(spectatorIdentity)) {
+          socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Please join the room before watching'));
+          return;
+        }
+        if ((member && room.status === GameRoomStatus.WAITING) ||
+            (participant.isSpectator === false && (room.status === GameRoomStatus.WAITING || room.getPlayer(spectatorIdentity)))) {
+          const key = `${room.roomId}:${spectatorIdentity}`;
+          const resume = () => this._handleJoinRoom(socket, { ...data, playerId: spectatorIdentity, isSpectator: false }, joinEpoch, key);
+          // A role can change while REST replies are in flight. An internal
+          // fallback already owns this actor queue; waiting on itself deadlocks.
+          return seatMutationKey === key ? resume() : this._serializeSeatMutation(key, resume);
+        }
+        if (participant.isSpectator === true && member && room.isInProgress() &&
+            room.getPlayer(spectatorIdentity) === member && member.socketId === memberSocket &&
+            member.apiSeatReservationVersion === memberVersion && memberVersion === participant.reservationVersion) {
+          // A REST forfeit can beat its socket leave. Revoke the old connection
+          // without changing live hand/index data or settling the match twice.
+          if (this.gameService.getPlayerIdBySocket(memberSocket) === spectatorIdentity) {
+            this.gameService.socketToPlayer.delete(memberSocket);
+          }
+          member.disconnect();
+          member.socketId = null;
+        }
+        if (this.gameService.getPlayerIdBySocket(socket.id) === spectatorIdentity) {
+          socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Your room role changed. Please reconnect.'));
+          return;
+        }
+      }
+      if (spectatorIdentity != null && !await this._reconcileSpectatorRoomSwitch(socket, room, spectatorIdentity)) {
+        socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Please leave your current room before joining another'));
+        return;
+      }
+      if (!joinIsCurrent() || this.gameService.getRoom(room.roomId) !== room) return;
+
+      const oldSpectatorRoom = this.spectatorSocketToRoom.get(socket.id);
+      if (oldSpectatorRoom && oldSpectatorRoom !== room.roomId) {
+        this._removeSpectatorBySocket(socket.id);
+        socket.leave(oldSpectatorRoom);
+        this._broadcastSpectatorsChanged(oldSpectatorRoom);
+      }
       socket.join(room.roomId);
-      this._addSpectator(socket, room.roomId, playerId, playerName, avatarUrl);
+      this._addSpectator(socket, room.roomId, spectatorIdentity, playerName, avatarUrl);
       this._broadcastSpectatorsChanged(room.roomId);
 
       // A spectator joining a lobby room is still a "join" — keep the host
@@ -2081,7 +2169,7 @@ class SocketHandlers {
         ErrorHandler.createSuccessResponse({
           roomId: room.roomId,
           isSpectator: true,
-          spectatorId: playerId || `spectator_${socket.id}`,
+          spectatorId: spectatorIdentity || `spectator_${socket.id}`,
           spectatorName: playerName || SPECTATOR_FALLBACK_NAME,
           players: room.getPlayers().map((p) => this._serializePlayer(p)),
         })
@@ -2100,7 +2188,7 @@ class SocketHandlers {
       this._sendStateToSpectator(
         socket,
         room,
-        playerId || `spectator_${socket.id}`,
+        spectatorIdentity || `spectator_${socket.id}`,
         playerName || SPECTATOR_FALLBACK_NAME,
         { includeGameStarted: true }
       );
@@ -2170,13 +2258,47 @@ class SocketHandlers {
     }
 
     const targetRoom = room;
+    if (!joinIsCurrent()) return;
+    if (targetRoom.seatConnectionProtocol === 1 && (!socket.data?.authenticated || socket.data.userId == null)) {
+      socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Authentication required to join this room'));
+      return;
+    }
+    if (targetRoom.seatConnectionProtocol === 1 && targetRoom.isInProgress()) {
+      const member = targetRoom.getPlayer(playerId);
+      const memberSocket = member?.socketId;
+      const memberVersion = member?.apiSeatReservationVersion;
+      let participant;
+      try {
+        participant = await this._seatBackendRequest(targetRoom, 'room-participant', {
+          roomId: String(targetRoom.roomId), playerId: String(playerId),
+        });
+      } catch (err) {
+        if (joinIsCurrent()) socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Could not verify room access. Please retry.'));
+        return;
+      }
+      if (!joinIsCurrent() || this.gameService.getRoom(targetRoom.roomId) !== targetRoom ||
+          targetRoom.getPlayer(playerId) !== member || member?.socketId !== memberSocket ||
+          member?.apiSeatReservationVersion !== memberVersion) return;
+      if (participant.authorized !== true || String(participant.playerId) !== String(playerId)) {
+        socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Please join the room before watching'));
+        return;
+      }
+      if (participant.isSpectator === true) {
+        return this._handleJoinRoom(socket, { ...data, isSpectator: true }, joinEpoch, seatMutationKey);
+      }
+    }
+    let verifiedSeatReservation = null;
 
     // An older client clears its spectator flag before claim_seat succeeds.
     // Reconnecting after losing that claim must not silently occupy a different
     // seat. Let the API reservation decide whether an unseated user may join.
-    if (targetRoom.seatReservationProtocol === 1 && this._backendUrlForRoom(targetRoom.roomId) &&
-        !targetRoom.getPlayer(playerId) && targetRoom.status === GameRoomStatus.WAITING) {
-      if (!targetRoom.getPlayer(playerId)) {
+    if ((targetRoom.seatReservationProtocol === 1 || targetRoom.seatLayoutProtocol === 1 || targetRoom.seatConnectionProtocol === 1) &&
+        this._backendUrlForRoom(targetRoom.roomId) && targetRoom.status === GameRoomStatus.WAITING &&
+        !targetRoom.awaitingNextRound) {
+      const memberBeforeVerification = targetRoom.getPlayer(playerId);
+      const socketBeforeVerification = memberBeforeVerification?.socketId;
+      const versionBeforeVerification = memberBeforeVerification?.apiSeatReservationVersion;
+      if (!memberBeforeVerification || targetRoom.seatLayoutProtocol === 1 || targetRoom.seatConnectionProtocol === 1) {
         let reservation;
         try {
           reservation = await this._fetchSeatReservation(targetRoom, playerId);
@@ -2185,14 +2307,47 @@ class SocketHandlers {
           socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Could not verify your seat. Please retry.'));
           return;
         }
-        if (socket.connected === false || this.gameService.getRoom(targetRoom.roomId) !== targetRoom ||
-            targetRoom.status !== GameRoomStatus.WAITING) return;
+        if (!joinIsCurrent() || this.gameService.getRoom(targetRoom.roomId) !== targetRoom ||
+            targetRoom.status !== GameRoomStatus.WAITING || targetRoom.awaitingNextRound) return;
+        if (targetRoom.getPlayer(playerId) !== memberBeforeVerification ||
+            memberBeforeVerification?.socketId !== socketBeforeVerification ||
+            memberBeforeVerification?.apiSeatReservationVersion !== versionBeforeVerification) {
+          socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Your seat changed. Please retry.'));
+          return;
+        }
         // An explicit claim queued during this lookup owns the desired chair.
         // Yield to it instead of auto-seating the reconnect in another chair.
         // Awaiting it here would deadlock the actor's mutation queue.
         if (this._pendingSeatClaims.has(`${targetRoom.roomId}:${playerId}`)) return;
+        if (reservation?.isSpectator === false && Number.isInteger(reservation.reservationVersion)) {
+          try {
+            reservation = await this._activateSeatConnection(socket, targetRoom, playerId, reservation);
+          } catch (err) {
+            socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Could not verify your seat connection. Please retry.'));
+            return;
+          }
+          if (!joinIsCurrent() || this.gameService.getRoom(targetRoom.roomId) !== targetRoom ||
+              this._seatsLocked(targetRoom) || targetRoom.getPlayer(playerId) !== memberBeforeVerification ||
+              memberBeforeVerification?.socketId !== socketBeforeVerification ||
+              memberBeforeVerification?.apiSeatReservationVersion !== versionBeforeVerification ||
+              this._pendingSeatClaims.has(`${targetRoom.roomId}:${playerId}`)) return;
+        }
         if (!reservation || reservation.isSpectator) {
-          await this.handleJoinRoom(socket, { ...data, isSpectator: true });
+          if (memberBeforeVerification) {
+            if (reservation?.isSpectator !== true || String(targetRoom.hostPlayerId) === String(playerId)) {
+              socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Your seat reservation changed. Please rejoin.'));
+              return;
+            }
+            // REST stand-up may have succeeded while its socket leave was
+            // lost. Reconcile that proven spectator locally, without another
+            // refund/leave webhook or a permanent reconnect error loop.
+            this._cancelWaitingLeave(targetRoom.roomId, playerId);
+            this.gameService._rebindSeatSocket(memberBeforeVerification, socket.id);
+            this.handleLeaveSeat(socket, { preserveJoinIntent: true });
+          }
+          await this._handleJoinRoom(socket, { ...data, isSpectator: true }, joinEpoch, seatMutationKey);
+          if (!joinIsCurrent() || targetRoom.getPlayer(playerId) ||
+              this.spectatorSocketToRoom.get(socket.id) !== targetRoom.roomId) return;
           socket.emit('kicked', { toSpectator: true, reason: 'seat_taken', timestamp: new Date().toISOString() });
           return;
         }
@@ -2200,6 +2355,7 @@ class SocketHandlers {
           socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Could not verify your seat reservation. Please retry.'));
           return;
         }
+        verifiedSeatReservation = reservation;
       }
     }
 
@@ -2283,10 +2439,31 @@ class SocketHandlers {
     const seatSocketBeforeJoin = seatBeforeJoin ? seatBeforeJoin.socketId : null;
     const seatStatusBeforeJoin = seatBeforeJoin ? seatBeforeJoin.status : null;
 
-    const result = this.gameService.joinRoom(targetRoom.roomId, playerId, playerName, socket.id, avatarUrl);
+    const reservedSeat = Number.isInteger(verifiedSeatReservation?.playerIndex)
+      ? verifiedSeatReservation.playerIndex : null;
+    if (!seatBeforeJoin && verifiedSeatReservation && targetRoom.seatLayoutProtocol === 1 && reservedSeat == null) {
+      socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Could not verify your reserved seat. Please retry.'));
+      return;
+    }
+    const previousRoom = this.gameService.getPlayerRoom(playerId);
+    let releasedSeatProof = null;
+    if (verifiedSeatReservation && previousRoom && previousRoom !== targetRoom &&
+        previousRoom.status === GameRoomStatus.WAITING && previousRoom.backendManaged) {
+      releasedSeatProof = await this._verifyReleasedRoomSeat(socket, targetRoom, previousRoom, playerId, verifiedSeatReservation);
+      if (!joinIsCurrent() || this.gameService.getRoom(targetRoom.roomId) !== targetRoom || this._seatsLocked(targetRoom)) return;
+    }
+    const result = this.gameService.joinRoom(targetRoom.roomId, playerId, playerName, socket.id, avatarUrl, reservedSeat, releasedSeatProof);
 
     if (result.success) {
+      if (result.previousRoom && result.previousPlayer) {
+        this._broadcastRoomSwitchDeparture(result.previousRoom, result.previousPlayer);
+      }
+      if (verifiedSeatReservation) {
+        result.player.apiSeatReservationVersion = verifiedSeatReservation.reservationVersion;
+      }
       socket.join(targetRoom.roomId);
+      const previousSpectatorRoomId = this._removeSpectatorBySocket(socket.id);
+      if (previousSpectatorRoomId) this._broadcastSpectatorsChanged(previousSpectatorRoomId);
 
       // Reconnected within the pre-game grace window → cancel the pending
       // seat-hold leave so the held seat stays (A1).
@@ -2302,6 +2479,11 @@ class SocketHandlers {
       this._noteHostHeartbeatPresence(targetRoom, playerId);
 
       if (result.reconnected) {
+        socket.emit(SocketEvents.PLAYER_JOINED, ErrorHandler.createSuccessResponse({
+          ...this._lobbyPlayersPayload(targetRoom, result.player),
+          roomId: targetRoom.roomId,
+          isSpectator: false,
+        }));
         // A REFRESH, NOT A RECONNECT.
         //
         // The seat was already bound to THIS socket and was not in grace, so
@@ -2406,6 +2588,7 @@ class SocketHandlers {
           playerName,
           playerIndex: result.player.playerIndex,
           roomId: targetRoom.roomId,
+          isSpectator: false,
           players: targetRoom.getPlayers().map((p) => this._serializePlayer(p)),
         })
       );
@@ -2476,7 +2659,104 @@ class SocketHandlers {
       }
     } else {
       logger.error(`[JOIN_ROOM] ✗ Player ${playerId} failed to join: ${result.error}`);
+      if (result.rosterChanged) this._broadcastSeatChanged(targetRoom);
+      if (verifiedSeatReservation && !seatBeforeJoin &&
+          ['Room is full', 'No available seat for player', 'Invalid reserved seat', 'Player is already in another active room'].includes(result.error)) {
+        await this._rejectReservedJoin(socket, data, targetRoom, verifiedSeatReservation, seatMutationKey);
+        return;
+      }
       socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse(result.error));
+    }
+  }
+
+  async _rejectReservedJoin(socket, data, room, reservation, seatMutationKey = null) {
+    const joinEpoch = socket._roomJoinEpoch;
+    const isCurrent = () => socket.connected !== false && socket._roomJoinEpoch === joinEpoch &&
+      this.gameService.getRoom(room.roomId) === room && !room.getPlayer(data.playerId);
+    if (!isCurrent()) return;
+    try {
+      const released = await this._releaseSeatReservation(room, data.playerId, reservation.reservationVersion);
+      if (!isCurrent()) return;
+      if (released.success !== true || released.isSpectator !== true) {
+        this._swapFail(socket, 'not_allowed', 'Your seat reservation changed. Please retry.');
+        return;
+      }
+      // Refund only the rejected destination. A socket still playing elsewhere
+      // must retain that role instead of becoming a spectator of two rooms.
+      const oldRoom = this.gameService.getPlayerRoom(data.playerId);
+      if (oldRoom && oldRoom !== room && oldRoom.getPlayer(data.playerId)?.socketId === socket.id) {
+        this._swapFail(socket, 'not_allowed', 'Please leave your current room before joining another');
+        return;
+      }
+      await this._handleJoinRoom(socket, { ...data, isSpectator: true }, joinEpoch, seatMutationKey);
+      if (!isCurrent() || this.spectatorSocketToRoom.get(socket.id) !== room.roomId) return;
+      socket.emit('kicked', { toSpectator: true, reason: 'seat_taken', timestamp: new Date().toISOString() });
+      this._swapFail(socket, 'seat_taken', 'That seat is taken. You are still a spectator.', reservation.playerIndex);
+    } catch (err) {
+      if (isCurrent()) this._swapFail(socket, 'not_allowed', 'Could not release the seat reservation. Please retry.');
+    }
+  }
+
+  _broadcastRoomSwitchDeparture(room, player) {
+    this._cancelWaitingLeave(room.roomId, player.playerId);
+    this._clearPendingFor(room, player.playerId);
+    this._clearInvitesFor(room, player.playerId);
+    this.io.sockets.sockets.get(player.socketId)?.leave(room.roomId);
+    this.io.to(room.roomId).emit(SocketEvents.PLAYER_LEFT, {
+      playerId: player.playerId, playerName: player.playerName, playerIndex: player.playerIndex,
+      timestamp: new Date().toISOString(),
+    });
+    if (this.gameService.getRoom(room.roomId) === room) this._broadcastSeatChanged(room);
+  }
+
+  async _reconcileSpectatorRoomSwitch(socket, targetRoom, playerId) {
+    const joinEpoch = socket._roomJoinEpoch;
+    const previousRoom = this.gameService.getPlayerRoom(playerId);
+    const player = previousRoom?.getPlayer(playerId);
+    if (!player || previousRoom === targetRoom) return true;
+    const sameSocket = player.socketId === socket.id;
+    if (!previousRoom.backendManaged || this._seatsLocked(previousRoom) ||
+        String(previousRoom.hostPlayerId) === String(playerId) || !this._backendUrlForRoom(previousRoom.roomId)) return !sameSocket;
+    const proof = { room: previousRoom, player, socketId: player.socketId, reservationVersion: player.apiSeatReservationVersion };
+    try {
+      const snapshot = await this._seatBackendRequest(previousRoom, 'room-fetch', { roomId: String(previousRoom.roomId) });
+      if (snapshot.exists !== true || snapshot.status !== 'open') return !sameSocket;
+      const previousReservation = (snapshot.players || []).find((entry) => String(entry.playerId) === String(playerId));
+      if (previousReservation && previousReservation.isSpectator !== true) return !sameSocket;
+      if (socket.connected === false || socket._roomJoinEpoch !== joinEpoch || this.gameService.getRoom(targetRoom.roomId) !== targetRoom ||
+          this.gameService.getRoom(previousRoom.roomId) !== previousRoom ||
+          this.gameService.getPlayerRoom(playerId) !== previousRoom ||
+          !this.gameService.canReleaseWaitingSeat(previousRoom, playerId, proof)) return false;
+      this.gameService.leaveRoom(playerId);
+      this._broadcastRoomSwitchDeparture(previousRoom, player);
+      return true;
+    } catch (err) {
+      return !sameSocket;
+    }
+  }
+
+  async _verifyReleasedRoomSeat(socket, targetRoom, previousRoom, playerId, reservation, desiredSeat = reservation.playerIndex) {
+    const player = previousRoom.getPlayer(playerId);
+    if (!player || this._seatsLocked(previousRoom) || String(previousRoom.hostPlayerId) === String(playerId) ||
+        !this._backendUrlForRoom(previousRoom.roomId) || targetRoom.getPlayerByIndex(desiredSeat)) return null;
+    const proof = { room: previousRoom, player, socketId: player.socketId, reservationVersion: player.apiSeatReservationVersion };
+    try {
+      const snapshot = await this._seatBackendRequest(previousRoom, 'room-fetch', { roomId: String(previousRoom.roomId) });
+      // exists:false also represents in-progress rooms in this API. It is NOT
+      // evidence that their seat was released.
+      if (snapshot.exists !== true || snapshot.status !== 'open') return null;
+      const previousReservation = (snapshot.players || []).find((entry) => String(entry.playerId) === String(playerId));
+      if (previousReservation && previousReservation.isSpectator !== true) return null;
+      const currentReservation = await this._fetchSeatReservation(targetRoom, playerId);
+      if (!currentReservation || currentReservation.isSpectator !== false ||
+          currentReservation.reservationVersion !== reservation.reservationVersion ||
+          currentReservation.playerIndex !== reservation.playerIndex || socket.connected === false ||
+          this.gameService.getRoom(previousRoom.roomId) !== previousRoom || this._seatsLocked(previousRoom) ||
+          previousRoom.getPlayer(playerId) !== player || player.socketId !== proof.socketId ||
+          player.apiSeatReservationVersion !== proof.reservationVersion) return null;
+      return proof;
+    } catch (err) {
+      return null;
     }
   }
 
@@ -2746,16 +3026,11 @@ class SocketHandlers {
         return;
       }
 
-      // Auto-repair socket mismatch (crucial for host to receive events)
-      if (player.socketId !== socket.id) {
-        logger.warn(
-          `[START_GAME] Player ${playerId} socket mismatch. Updating from ${player.socketId} to ${socket.id}`
-        );
-        player.socketId = socket.id;
-        // Ensure mapped in service
-        this.gameService.socketToPlayer.set(socket.id, playerId);
-        // Ensure joined to socket room
-        socket.join(room.roomId);
+      // Only verified join/reconnect may rebind a seat. An old authenticated
+      // socket must not take it back by sending start_game after reconnect.
+      if (!this._socketOwnsSeat(socket, player)) {
+        socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Please rejoin before starting the game'));
+        return;
       }
 
       // Only host can start
@@ -2766,6 +3041,11 @@ class SocketHandlers {
         );
         return;
       }
+    }
+
+    if (room.startAttemptProtocol === 1 && room.status === GameRoomStatus.WAITING) {
+      socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Please start the room through the lobby API'));
+      return;
     }
 
     // Check if room is full
@@ -2932,6 +3212,18 @@ class SocketHandlers {
    * @returns {Object}
    */
   triggerStartGame(roomId, options = {}) {
+    const id = roomId == null ? roomId : String(roomId);
+    if (options.attemptId != null || this.gameService.getRoom(id)?.startAttemptProtocol === 1) {
+      return startBackendAttempt(this, id, options);
+    }
+    return this._triggerStartGameNow(roomId, options);
+  }
+
+  abortStartFromBackend(data = {}) {
+    return abortBackendAttempt(this, String(data.roomId || ''), data.attemptId);
+  }
+
+  _triggerStartGameNow(roomId, options = {}) {
     const skins = options.skins || {};
     const normalizedRoomId = roomId === null || roomId === undefined ? roomId : String(roomId);
     let room = this.gameService.getRoom(normalizedRoomId);
@@ -3016,6 +3308,7 @@ class SocketHandlers {
         this._stopHostHeartbeat(room);
         logger.info(`[TRIGGER_START_GAME] Game manually started via API in room ${room.roomId}`);
 
+        const announceStart = () => {
         room.getPlayers().forEach((p) => {
           if (p.isBot === true) return;
           const playerSocket = this.io.sockets.sockets.get(p.socketId);
@@ -3054,10 +3347,17 @@ class SocketHandlers {
           }
         }
 
+        };
+        if (!options.deferStartAnnouncement) announceStart();
+
         const dealResult = this._autoDealAfterStart(room, 'webhook start');
         if (!dealResult.success) {
-          this._sendInitialGameState(room);
+          if (!options.deferStartAnnouncement) this._sendInitialGameState(room);
           return { success: false, error: dealResult.error || 'Failed to deal cards' };
+        }
+        if (options.deferStartAnnouncement) {
+          announceStart();
+          this._sendInitialGameState(room);
         }
         this._emitPartnerWebhook('game.started', {
           roomId: room.roomId,
@@ -3162,7 +3462,7 @@ class SocketHandlers {
     // host (host-leave ends the room), so there is no legitimate socket-side host
     // to protect against a stale sync here.
     if (data.hostPlayerId) {
-      room.hostPlayerId = data.hostPlayerId;
+      room.hostPlayerId = String(data.hostPlayerId);
     }
     // Mark the room backend-owned so the first-joiner host fallbacks never
     // reassign the host away from what the backend synced.
@@ -3170,6 +3470,9 @@ class SocketHandlers {
     // Opt in only when the owning backend supports versioned seat rejection.
     // Other apps can share this socket server without implementing that API.
     if (data.seatReservationProtocol === 1) room.seatReservationProtocol = 1;
+    if (data.seatConnectionProtocol === 1) room.seatConnectionProtocol = 1;
+    if (data.seatLayoutProtocol === 1) room.seatLayoutProtocol = 1;
+    if (data.startAttemptProtocol === 1) room.startAttemptProtocol = 1;
 
     // Routing (1 socket → 2 backends): each backend may send its own callback
     // base URL so room-closed/left/count webhooks go back to the right app. When
@@ -3177,6 +3480,7 @@ class SocketHandlers {
     if (typeof data.backendUrl === 'string' && data.backendUrl.length > 0) {
       room.backendBaseUrl = data.backendUrl;
     }
+    if (room.restoreWaitingHostSeat?.()) this._broadcastSeatChanged(room);
 
     if (typeof data.name === 'string' && data.name.length > 0) {
       room.name = data.name;
@@ -3235,6 +3539,7 @@ class SocketHandlers {
     // Start (idempotent) the lobby host heartbeat for the freshly-synced room.
     // No-op if it just auto-started above (status → inProgress) or if disabled.
     this._ensureHostHeartbeat(room);
+    this._queueSeatLayoutSync(room);
 
     // Tell connected lobby clients when (and only when) a host actually changed
     // a client-visible setting. Runs after autoStart so a sync that started the
@@ -3659,6 +3964,7 @@ class SocketHandlers {
       turnTimeLimitSeconds: room.turnTimeLimit,
       hostPlayerId: room.hostPlayerId || null,
       hostConnected,
+      startAttemptProtocol: 1,
       playerCount: players.length,
       playerIds: players.map((player) => String(player.playerId)),
       players: players.map((player) => ({
@@ -4134,6 +4440,7 @@ class SocketHandlers {
    * @param {Socket} socket
    */
   handleLeaveRoom(socket) {
+    socket._roomJoinEpoch = (socket._roomJoinEpoch || 0) + 1;
     const playerId = this.gameService.getPlayerIdBySocket(socket.id);
     if (!playerId) {
       const spectatorRoomId = this.spectatorSocketToRoom.get(socket.id);
@@ -4154,6 +4461,11 @@ class SocketHandlers {
 
     const room = this.gameService.getPlayerRoom(playerId);
     const leavingPlayer = room ? room.getPlayer(playerId) : null;
+    if (leavingPlayer && !this._socketOwnsSeat(socket, leavingPlayer)) return;
+    if (room?._pendingBackendStart) {
+      socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Room is starting. Please wait.'));
+      return;
+    }
     logger.info(`[LEAVE_ROOM] Player ${playerId} leaving room ${room?.roomId}`);
 
     // A player leaving a room whose game already ENDED must NOT re-forfeit,
@@ -4227,7 +4539,7 @@ class SocketHandlers {
           playerName: leavingPlayer?.playerName,
           timestamp: new Date().toISOString(),
         });
-        this._notifyBackendPlayerLeft(room.roomId, playerId);
+        this._notifyBackendPlayerLeft(room.roomId, playerId, false, leavingPlayer, room);
         // The seat is EMPTY now, and only the authoritative roster says so.
         // PLAYER_LEFT carries ONE id; clients patch a counter with it and never
         // rebuild their seat grid from it, so the leaver stayed drawn in their
@@ -4729,26 +5041,64 @@ class SocketHandlers {
     return (room && room.backendBaseUrl) || (config.backend && config.backend.url) || null;
   }
 
-  _notifyBackendPlayerLeft(roomId, playerId, inProgress = false) {
-    const backendUrl = this._backendUrlForRoom(roomId);
-    if (!backendUrl || typeof fetch !== 'function') return;
-    const headers = { 'Content-Type': 'application/json' };
-    if (config.backend.webhookSecret) headers['x-webhook-secret'] = config.backend.webhookSecret;
-    fetch(`${backendUrl.replace(/\/$/, '')}/api/webhooks/room-player-left`, {
-      method: 'POST',
-      headers,
-      // `inProgress` = the game is live and this player is being replaced by a bot
-      // (grace expiry). The backend then ONLY detaches this user + recomputes the
-      // count; it must NOT close the room (other humans/bots are still playing),
-      // even if the leaver was the creator.
-      body: JSON.stringify({
-        roomId: String(roomId),
-        playerId: String(playerId),
-        inProgress: inProgress === true,
-      }),
-    }).catch((err) =>
-      logger.warn(`[LEAVE_ROOM] backend room-player-left webhook failed: ${err.message}`)
-    );
+  _notifyBackendPlayerLeft(roomId, playerId, inProgress = false, departingPlayer = null, departingRoom = null) {
+    const room = departingRoom || this.gameService.getRoom(roomId);
+    const backendBaseUrl = room?.backendBaseUrl || this._backendUrlForRoom(roomId);
+    if (!backendBaseUrl || typeof fetch !== 'function') return;
+    const reservationVersion = departingPlayer?.apiSeatReservationVersion;
+    // An unbound legacy runtime cannot authorize releasing a modern allocation.
+    if ((room?.seatLayoutProtocol === 1 || room?.seatConnectionProtocol === 1) &&
+        !Number.isInteger(reservationVersion)) return;
+    const pendingOperation = room?._seatLayoutSync?.operation;
+    const sent = pendingOperation?.body.players.find((player) => String(player.playerId) === String(playerId));
+    const operation = sent && pendingOperation.members.get(String(playerId)) === departingPlayer &&
+      sent.reservationVersion === reservationVersion ? pendingOperation : null;
+    const key = `${roomId}:${playerId}:${reservationVersion}:${departingPlayer?.socketId || ''}`;
+    let job = this._pendingBackendLeaves.get(key);
+    if (!job) {
+      job = {
+        room: { backendBaseUrl }, operation, running: null,
+        body: { roomId: String(roomId), playerId: String(playerId), inProgress: inProgress === true,
+          ...(Number.isInteger(reservationVersion) ? { reservationVersion } : {}) },
+      };
+      this._pendingBackendLeaves.set(key, job);
+    }
+    this._startBackendHeartbeat();
+    return this._runBackendPlayerLeft(key, job);
+  }
+
+  _runBackendPlayerLeft(key, job) {
+    if (job.running) return job.running;
+    job.running = Promise.resolve().then(async () => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          if (job.operation) {
+            // A layout POST may have committed before its ACK was lost. Replay
+            // that exact receipt; never borrow a fresh REST generation to leave.
+            const result = await this._seatBackendRequest(job.room, 'room-seat-layout', job.operation.body);
+            if (result.applied === true) {
+              const sent = job.operation.body.players.find((player) => String(player.playerId) === job.body.playerId);
+              const applied = result.players?.find((player) => String(player.playerId) === job.body.playerId);
+              if (!applied || applied.playerIndex !== sent.seat ||
+                  !Number.isInteger(applied.reservationVersion) || applied.reservationVersion < sent.reservationVersion) {
+                throw new Error('Missing seat layout receipt for departing player');
+              }
+              job.body.reservationVersion = applied.reservationVersion;
+            }
+            job.operation = null;
+          }
+          const result = await this._seatBackendRequest(job.room, 'room-player-left', job.body);
+          if (result.reason === 'room_start_pending') throw new Error('Room start is pending');
+          if (result.success !== true) throw new Error('Backend did not acknowledge player leave');
+          // A version mismatch is also final: the newer allocation is untouched.
+          if (this._pendingBackendLeaves.get(key) === job) this._pendingBackendLeaves.delete(key);
+          return;
+        } catch (err) {
+          if (attempt === 2) logger.warn(`[LEAVE_ROOM] backend player leave pending retry: ${err.message}`);
+        }
+      }
+    }).finally(() => { job.running = null; });
+    return job.running;
   }
 
   /**
@@ -4802,7 +5152,7 @@ class SocketHandlers {
    */
   _startBackendHeartbeat() {
     const backendUrl = config.backend && config.backend.url;
-    if (!backendUrl || typeof fetch !== 'function') return;
+    if ((!backendUrl && this._pendingBackendLeaves.size === 0) || typeof fetch !== 'function') return;
     if (this._heartbeatTimer) return;
     this._heartbeatTimer = setInterval(
       () => this._notifyBackendHeartbeat(),
@@ -4825,6 +5175,8 @@ class SocketHandlers {
     const defaultBackendUrl = config.backend && config.backend.url;
     if (typeof fetch !== 'function') return;
 
+    for (const [key, job] of this._pendingBackendLeaves) this._runBackendPlayerLeft(key, job);
+
     // Group live room ids by their owning backend so a true 1-socket/2-backend
     // co-deploy heartbeats EVERY backend's rooms, not just the configured default.
     // A room's `backendBaseUrl` (synced from sync-room `backendUrl`) is the REQUIRED
@@ -4833,6 +5185,9 @@ class SocketHandlers {
     const idsByBackend = new Map();
     const rooms = this.gameService?.getActiveRooms ? this.gameService.getActiveRooms() : [];
     for (const room of rooms) {
+      if (room._seatLayoutSync?.dirty && !room._seatLayoutSync.running) {
+        this._queueSeatLayoutSync(room);
+      }
       const hasConnectedHuman = room
         .getPlayers()
         .some((p) => p.isBot !== true && p.isConnected);
@@ -4967,6 +5322,10 @@ class SocketHandlers {
       // is under way (#11 intermission): stripping a seat — or killing the room
       // because the dropper is the host — mid-match must never happen.
       if (!room || room.isInProgress() || room.awaitingNextRound) return;
+      if (room._pendingBackendStart) {
+        this._scheduleWaitingLeave(roomId, playerId);
+        return;
+      }
       const player = room.getPlayer(playerId);
       // Reconnected within the window (a live socket re-marked them active) → keep
       // the held seat.
@@ -4991,7 +5350,7 @@ class SocketHandlers {
           timestamp: new Date().toISOString(),
         });
       } else {
-        this._notifyBackendPlayerLeft(roomId, playerId);
+        this._notifyBackendPlayerLeft(roomId, playerId, false, player, room);
         this.io.to(roomId).emit(SocketEvents.PLAYER_LEFT, {
           playerId,
           playerIndex: player.playerIndex,
@@ -5110,6 +5469,9 @@ class SocketHandlers {
       this._stopHostHeartbeat(liveRoom || room);
       return;
     }
+    if (liveRoom._seatLayoutSync?.dirty && !liveRoom._seatLayoutSync.running) {
+      this._queueSeatLayoutSync(liveRoom);
+    }
 
     // Resolve the host socket: hostPlayerId → seat's socketId → live socket.
     const hostPlayer = liveRoom.hostPlayerId
@@ -5191,6 +5553,7 @@ class SocketHandlers {
    * @param {'host_heartbeat_timeout'|'host_left'} reason
    */
   _killLobbyRoomHostGone(room, reason) {
+    if (room?._pendingBackendStart) return;
     if (!room) return;
     const roomId = room.roomId;
     // Guard against a double-kill (e.g. heartbeat tick racing an explicit leave):
@@ -5266,7 +5629,14 @@ class SocketHandlers {
    * @returns {boolean}
    */
   _seatsLocked(room) {
-    return !!room && (room.isInProgress() || room.awaitingNextRound === true);
+    return !!room && (room.status !== GameRoomStatus.WAITING || room.awaitingNextRound === true ||
+      !!room._pendingBackendStart);
+  }
+
+  _socketOwnsSeat(socket, player) {
+    return !!player && socket.connected !== false && player.socketId === socket.id &&
+      (this.gameService.getPlayerRoom(player.playerId)?.seatConnectionProtocol !== 1 || socket.data?.authenticated === true) &&
+      this._assertSocketIdentity(socket, player.playerId);
   }
 
   /**
@@ -5294,7 +5664,11 @@ class SocketHandlers {
     }
 
     const player = room.getPlayer(playerId);
-    if (!player) return;
+    if (!this._socketOwnsSeat(socket, player)) return;
+
+    if (String(room.hostPlayerId) === String(playerId) || player.playerIndex === 0) {
+      return this._swapFail(socket, 'host_seat', 'The host seat can\'t be moved');
+    }
 
     const currentIdx = player.playerIndex;
     const currentTeam = currentIdx % 2; // 0 or 1
@@ -5307,7 +5681,7 @@ class SocketHandlers {
     let targetIdx = -1;
 
     // Check possible indices for target team (0, 2 for Team A; 1, 3 for Team B)
-    for (let i = targetTeam; i < maxPlayers; i += 2) {
+    for (let i = targetTeam === 0 ? 2 : 1; i < maxPlayers; i += 2) {
       if (!usedIndices.includes(i)) {
         targetIdx = i;
         break;
@@ -5320,35 +5694,9 @@ class SocketHandlers {
         `[SWITCH_TEAM] Player ${playerId} switching from index ${currentIdx} to ${targetIdx}`
       );
       player.playerIndex = targetIdx;
-
-      // Broadcast update via player_joined (or a new event, but player_joined forces refresh in client)
-      // Ideally we should have a 'room_updated' event.
-      // But looking at client:
-      /*
-        if (message is PlayerJoinedMessage) { _refreshRoom(); }
-      */
-      // So sending PlayerJoinedMessage might trigger refresh, but it implies a NEW player.
-      // Better to send a custom message or just trigger a refresh.
-
-      // Let's send a generic room update if client supports it, OR just emit PLAYER_JOINED again?
-      // No, let's look at client code.
-      // Client has:
-      // _socketManager!.messageStream.listen((message) { ... })
-
-      // I will emit 'player_joined' for now as it triggers _refreshRoom() which fetches fresh data.
-      // Or I can add 'room_updated' to client.
-
-      // Let's stick to existing events if possible.
-      // But sending player_joined for existing player might be confusing?
-      // Client just calls _refreshRoom().
-
-      this.io.to(room.roomId).emit(SocketEvents.PLAYER_JOINED, {
-        playerId: player.playerId,
-        playerName: player.playerName,
-        playerIndex: player.playerIndex,
-        timestamp: new Date().toISOString(),
-        isSwitch: true, // flag for debug
-      });
+      this._clearPendingFor(room, playerId);
+      this._clearInvitesForSeat(room, targetIdx);
+      this._broadcastSeatChanged(room);
     } else {
       socket.emit(SocketEvents.ERROR, ErrorHandler.createErrorResponse('Target team is full'));
     }
@@ -5402,7 +5750,7 @@ class SocketHandlers {
     if (Number.isInteger(seat)) payload.seat = seat;
     if (!socket) return;
     socket.emit('swap_failed', payload);
-    if (reason === 'seat_taken') {
+    if (reason === 'seat_taken' || reason === 'host_seat') {
       // The competing claim may have completed before this client received the
       // winning roster. Reply with current occupancy as well as the rejection.
       const playerId = this.gameService.getPlayerIdBySocket(socket.id);
@@ -5491,7 +5839,7 @@ class SocketHandlers {
     const roomId = this.spectatorSocketToRoom.get(socket.id);
     const room = roomId ? this.gameService.getRoom(roomId) : null;
     const spectator = this.roomSpectators.get(roomId)?.get(socket.id);
-    if (room?.seatReservationProtocol !== 1 || !this._backendUrlForRoom(roomId) || !spectator ||
+    if ((room?.seatReservationProtocol !== 1 && room?.seatLayoutProtocol !== 1 && room?.seatConnectionProtocol !== 1) || !this._backendUrlForRoom(roomId) || !spectator ||
         this.gameService.getPlayerIdBySocket(socket.id)) {
       return this._claimSeatNow(socket, data);
     }
@@ -5528,10 +5876,155 @@ class SocketHandlers {
     return response.json();
   }
 
+  _seatLayoutRoomIsLive(room) {
+    return room?.seatLayoutProtocol === 1 && room.status === GameRoomStatus.WAITING &&
+      !this._seatsLocked(room) && this.gameService.getRoom(room.roomId) === room &&
+      !!this._backendUrlForRoom(room.roomId) && typeof fetch === 'function';
+  }
+
+  /** Coalesce lobby changes without blocking the socket's seat mutations. */
+  _queueSeatLayoutSync(room) {
+    if (!this._seatLayoutRoomIsLive(room)) return;
+    const state = room._seatLayoutSync ||= { revision: 0, dirty: false, running: null };
+    state.revision += 1;
+    state.dirty = true;
+    if (state.running) return state.running;
+    // Start on the next microtask so a synchronous batch publishes only its
+    // final layout. The running promise belongs to this exact room instance.
+    state.running = Promise.resolve()
+      .then(() => this._syncSeatLayout(room, state))
+      .catch((err) => logger.warn(`[SEAT_LAYOUT] room ${room.roomId}: ${err.message}`))
+      .finally(() => { state.running = null; });
+    return state.running;
+  }
+
+  async _syncSeatLayout(room, state) {
+    const canWrite = () => this._seatLayoutRoomIsLive(room) &&
+      (!this._ownershipEnabled() || this.ownedRoomIds.has(String(room.roomId)));
+    let failure = null;
+    for (let attempt = 0; attempt < 3 && canWrite(); attempt += 1) {
+      try {
+        if (!state.operation) {
+          const members = new Map(room.getPlayers().map((player) => [String(player.playerId), player]));
+          if (![...members.values()].some((player) => player.isBot !== true)) {
+            state.dirty = false;
+            return;
+          }
+          const revision = state.revision;
+          const snapshot = await this._seatBackendRequest(room, 'room-fetch', { roomId: String(room.roomId) });
+          if (!canWrite()) return;
+          if (snapshot.exists !== true || snapshot.status !== 'open' || snapshot.seatLayoutProtocol !== 1) return;
+          // This response may predate a sit/leave as well as a move. Refetch
+          // changed membership or intent instead of declaring a stale no-op clean.
+          if (revision !== state.revision || room.getPlayers().some((player) =>
+            members.get(String(player.playerId)) !== player)) continue;
+          const reservations = new Map((snapshot.players || []).map((player) => [String(player.playerId), player]));
+          let unresolved = false;
+          const players = room.getPlayers().filter((player) => player.isBot !== true).flatMap((player) => {
+            const reservation = reservations.get(String(player.playerId));
+            const key = `${room.roomId}:${player.playerId}`;
+            if (!reservation || reservation.isSpectator !== false ||
+                this._pendingSeatClaims.has(key) || this._unresolvedSeatRejections.has(key) ||
+                !Number.isInteger(reservation.reservationVersion) || reservation.reservationVersion < 0 ||
+                !Number.isInteger(reservation.playerIndex)) {
+              unresolved = true;
+              return [];
+            }
+            // Legacy sessions can establish proof only when API and runtime
+            // already agree. A mismatch needs a verified join/claim, never a
+            // fresh API version borrowed to authorize an old runtime allocation.
+            if (player.apiSeatReservationVersion == null && reservation.playerIndex === player.playerIndex) {
+              player.apiSeatReservationVersion = reservation.reservationVersion;
+            }
+            if (player.apiSeatReservationVersion !== reservation.reservationVersion) {
+              unresolved = true;
+              return [];
+            }
+            return [{
+              playerId: String(player.playerId),
+              reservationVersion: reservation.reservationVersion,
+              expectedSeat: reservation.playerIndex,
+              seat: player.playerIndex,
+            }];
+          });
+          if (!players.some((player) => player.expectedSeat !== player.seat)) {
+            state.dirty = unresolved;
+            return;
+          }
+          state.operation = {
+            body: { roomId: String(room.roomId), operationId: randomBytes(16).toString('hex'), players },
+            members, revision, unresolved,
+          };
+        }
+        // After a timeout, replay the EXACT operation before fetching another
+        // version. Its API receipt distinguishes a committed lost ACK from a
+        // new REST allocation. Later moves wait in revision/dirty, not in HTTP.
+        const operation = state.operation;
+        const result = await this._seatBackendRequest(room, 'room-seat-layout', operation.body);
+        if (!canWrite()) return;
+        state.operation = null;
+        if (result.applied === true) {
+          const receipt = new Map((result.players || []).map((player) => [String(player.playerId), player]));
+          let acknowledged = true;
+          for (const sent of operation.body.players) {
+            const member = operation.members.get(sent.playerId);
+            const applied = receipt.get(sent.playerId);
+            if (room.getPlayer(sent.playerId) === member &&
+                member.apiSeatReservationVersion === sent.reservationVersion &&
+                applied?.playerIndex === sent.seat && Number.isInteger(applied.reservationVersion) &&
+                applied.reservationVersion >= sent.reservationVersion) {
+              member.apiSeatReservationVersion = applied.reservationVersion;
+            } else {
+              acknowledged = false;
+            }
+          }
+          this._persistLobbyRoster(room);
+          if (operation.revision === state.revision && !operation.unresolved && acknowledged) {
+            state.dirty = false;
+            return;
+          }
+        }
+        failure = result.reason || 'layout changed while syncing';
+      } catch (err) {
+        failure = err.message;
+      }
+    }
+    // Leave dirty after bounded retries; the next roster update/heartbeat
+    // retries it. No background loop and no dependency in the room-list API.
+    if (failure && canWrite()) logger.warn(`[SEAT_LAYOUT] room ${room.roomId} pending retry: ${failure}`);
+  }
+
   async _fetchSeatReservation(room, playerId) {
     const snapshot = await this._seatBackendRequest(room, 'room-fetch', { roomId: String(room.roomId) });
     if (snapshot.exists !== true || snapshot.status !== 'open') return null;
     return (snapshot.players || []).find((player) => String(player.playerId) === String(playerId)) || null;
+  }
+
+  async _activateSeatConnection(socket, room, playerId, reservation) {
+    if (room.seatConnectionProtocol !== 1) return reservation;
+    if (!socket.data?.authenticated || socket.data.userId == null || !this._assertSocketIdentity(socket, playerId)) {
+      throw new Error('Authentication required');
+    }
+    const body = {
+      roomId: String(room.roomId), playerId: String(playerId),
+      expectedReservationVersion: reservation.reservationVersion, connectionId: socket.id,
+    };
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const result = await this._seatBackendRequest(room, 'room-seat-activate', body);
+        if (result.activated === true && Number.isInteger(result.reservationVersion) &&
+            result.reservationVersion >= 0 && Number.isInteger(result.playerIndex)) {
+          return { ...reservation, isSpectator: false, reservationVersion: result.reservationVersion, playerIndex: result.playerIndex };
+        }
+        if (result.reason === 'not_joined') return { ...reservation, isSpectator: true };
+        throw Object.assign(new Error(result.reason || 'Seat activation rejected'), { rejected: true });
+      } catch (err) {
+        if (err.rejected) throw err;
+        lastError = err;
+      }
+    }
+    throw lastError;
   }
 
   async _releaseSeatReservation(room, playerId, reservationVersion) {
@@ -5576,6 +6069,14 @@ class SocketHandlers {
     return { ...reservation, isSpectator: true };
   }
 
+  _canReleasePreviousRoomForSeatClaim(room, playerId, proof) {
+    // A completed match retains its roster briefly for result replay. It must
+    // not reserve that player's next lobby seat, just as normal joinRoom allows
+    // switching away from it. Intermission/start handoffs still own the player.
+    return (room?.status === GameRoomStatus.FINISHED && !room.awaitingNextRound &&
+      !room._pendingBackendStart) || this.gameService.canReleaseWaitingSeat(room, playerId, proof);
+  }
+
   async _claimReservedSeat(socket, data, room, spectator) {
     const playerId = spectator.spectatorId;
     if (room.getPlayer(playerId)) {
@@ -5585,6 +6086,11 @@ class SocketHandlers {
     try {
       reservation = await this._fetchSeatReservation(room, playerId);
       reservation = await this._reconcileSeatRejection(room, playerId, reservation);
+      if (reservation?.isSpectator === false && Number.isInteger(reservation.reservationVersion) &&
+          socket.connected !== false && this.gameService.getRoom(room.roomId) === room &&
+          this.roomSpectators.get(room.roomId)?.get(socket.id) === spectator && !room.getPlayer(playerId)) {
+        reservation = await this._activateSeatConnection(socket, room, playerId, reservation);
+      }
     } catch (err) {
       this._swapFail(socket, 'not_allowed', 'Could not verify your seat. Please retry.');
       return;
@@ -5603,13 +6109,41 @@ class SocketHandlers {
     const seat = Number(data.seat);
     const hasReservation = reservation?.isSpectator === false &&
       Number.isInteger(reservation.reservationVersion) && reservation.reservationVersion >= 0;
-    const canClaim = stillWatching() && !this._seatsLocked(room) &&
-      Number.isInteger(seat) && seat >= 0 && seat < room.maxPlayers &&
+    const otherRoom = this.gameService.getPlayerRoom(playerId);
+    let releasedSeatProof = null;
+    if (hasReservation && otherRoom && otherRoom !== room && otherRoom.backendManaged &&
+        otherRoom.status === GameRoomStatus.WAITING && stillWatching()) {
+      releasedSeatProof = await this._verifyReleasedRoomSeat(socket, room, otherRoom, playerId, reservation, seat);
+    }
+    const previousRoom = this.gameService.getPlayerRoom(playerId);
+    const canReleasePreviousRoom = !previousRoom || previousRoom === room ||
+      this._canReleasePreviousRoomForSeatClaim(previousRoom, playerId, releasedSeatProof);
+    const canClaim = stillWatching() && !this._seatsLocked(room) && canReleasePreviousRoom &&
+      Number.isInteger(seat) && seat > 0 && seat < room.maxPlayers &&
       !room.getPlayerByIndex(seat) && !room.isFull();
     if (hasReservation && canClaim) {
       // No await between occupancy validation and the actual seat mutation.
-      return this._claimSeatNow(socket, data);
+      const result = this._claimSeatNow(socket, data, releasedSeatProof);
+      const admitted = room.getPlayer(playerId);
+      if (admitted?.socketId === socket.id) {
+        admitted.apiSeatReservationVersion = reservation.reservationVersion;
+      }
+      return result;
     }
+
+    this._logRoomLifecycle('seat_claim_rejected', {
+      roomId: room.roomId,
+      playerId,
+      requestedSeat: seat,
+      occupantPlayerId: room.getPlayerByIndex(seat)?.playerId || null,
+      previousRoomId: previousRoom?.roomId || null,
+      previousRoomStatus: previousRoom?.status || null,
+      hasReservation,
+      reason: !stillWatching() ? 'stale_claim' : !hasReservation ? 'missing_reservation' :
+        this._seatsLocked(room) ? 'room_locked' : !canReleasePreviousRoom ? 'another_active_room' :
+          !Number.isInteger(seat) || seat <= 0 || seat >= room.maxPlayers ? 'invalid_seat' :
+            room.getPlayerByIndex(seat) ? 'seat_taken' : 'room_full',
+    });
 
     if (hasReservation) {
       try {
@@ -5640,7 +6174,7 @@ class SocketHandlers {
     }
   }
 
-  _claimSeatNow(socket, data = {}) {
+  _claimSeatNow(socket, data = {}, releasedSeatProof = null) {
     // A seated player is resolved via the socket→player binding; a spectator has
     // NO such binding (they live only in roomSpectators/spectatorSocketToRoom).
     // Resolve both so a spectator can claim a seat too.
@@ -5660,6 +6194,9 @@ class SocketHandlers {
     if (!Number.isInteger(seat) || seat < 0 || seat >= room.maxPlayers) {
       return this._swapFail(socket, 'not_allowed', 'Invalid seat');
     }
+    if (seat === 0 && (room.backendManaged || room.hostPlayerId != null)) {
+      return this._swapFail(socket, 'host_seat', 'The host seat can\'t be taken', seat);
+    }
 
     // Re-read live seat occupancy right before mutating (single-threaded, but
     // keep the read/decision adjacent so it stays correct under refactors).
@@ -5668,7 +6205,10 @@ class SocketHandlers {
     // ── Path A: caller is already a seated, non-bot player → move their seat. ──
     if (seatedPlayer && !seatedPlayer.isBot) {
       const playerId = seatedPlayerId;
-      if (room.hostPlayerId === playerId) {
+      if (!this._socketOwnsSeat(socket, seatedPlayer)) {
+        return this._swapFail(socket, 'not_allowed', 'Please rejoin before moving seats');
+      }
+      if (String(room.hostPlayerId) === String(playerId) || seatedPlayer.playerIndex === 0) {
         return this._swapFail(socket, 'host_seat', 'The host seat can\'t be moved');
       }
       if (seat === seatedPlayer.playerIndex) return; // already seated there
@@ -5726,6 +6266,10 @@ class SocketHandlers {
     if (room.getPlayer(playerId)) {
       return this._swapFail(socket, 'not_allowed', 'Already seated');
     }
+    const otherRoom = this.gameService.getPlayerRoom(playerId);
+    if (otherRoom && otherRoom !== room && !this._canReleasePreviousRoomForSeatClaim(otherRoom, playerId, releasedSeatProof)) {
+      return this._swapFail(socket, 'not_allowed', 'You already have a seat in another room');
+    }
 
     // Convert spectator → seated player. Mirror gameService.joinRoom: build a
     // PlayerSession at the requested seat, register the socket→player bindings,
@@ -5742,8 +6286,13 @@ class SocketHandlers {
     if (!room.addPlayer(session)) {
       return this._swapFail(socket, 'seat_taken', 'That seat is taken', seat);
     }
-    // Backend-owned room: never let a spectator who sits down become the host.
-    if (!room.hostPlayerId && !room.backendManaged) {
+    if (otherRoom && otherRoom !== room) {
+      const departed = otherRoom.getPlayer(playerId);
+      this.gameService.leaveRoom(playerId);
+      if (departed) this._broadcastRoomSwitchDeparture(otherRoom, departed);
+    }
+    // Standalone rooms can still establish their first host by claiming zero.
+    if (!room.hostPlayerId && !room.backendManaged && seat === 0) {
       room.hostPlayerId = playerId;
     }
     this.gameService.playerToRoom.set(playerId, room.roomId);
@@ -5779,19 +6328,23 @@ class SocketHandlers {
     const targetPlayerId = data.targetPlayerId != null ? String(data.targetPlayerId) : null;
     const targetSeat = Number(data.targetSeat);
     const requester = room.getPlayer(requesterId);
-    if (!requester || !targetPlayerId) {
+    if (!this._socketOwnsSeat(socket, requester) || !targetPlayerId) {
       return this._swapFail(socket, 'not_allowed', 'Invalid swap request');
     }
     if (targetPlayerId === requesterId) return; // can't swap with yourself
 
     // Host is fixed: neither side may be the host.
-    if (room.hostPlayerId === requesterId || room.hostPlayerId === targetPlayerId) {
+    if (room.hostPlayerId === requesterId || room.hostPlayerId === targetPlayerId ||
+        requester.playerIndex === 0 || targetSeat === 0) {
       return this._swapFail(socket, 'host_seat', 'The host seat can\'t be swapped');
     }
 
     const target = room.getPlayer(targetPlayerId);
     if (!target || (Number.isInteger(targetSeat) && target.playerIndex !== targetSeat)) {
       return this._swapFail(socket, 'seat_taken', 'That seat just changed', targetSeat);
+    }
+    if (target.playerIndex === 0) {
+      return this._swapFail(socket, 'host_seat', 'The host seat can\'t be swapped');
     }
     if (target.isBot) {
       return this._swapFail(socket, 'not_allowed', 'Can\'t swap with a bot');
@@ -5844,6 +6397,8 @@ class SocketHandlers {
     if (!targetId) return;
     const room = this.gameService.getPlayerRoom(targetId);
     if (!room) return;
+    const target = room.getPlayer(targetId);
+    if (!this._socketOwnsSeat(socket, target)) return;
 
     const pend = this._roomPending(room);
     const pending = pend.get(targetId);
@@ -5855,7 +6410,6 @@ class SocketHandlers {
     this._clearPending(room, targetId);
 
     const requester = room.getPlayer(pending.requesterId);
-    const target = room.getPlayer(targetId);
     const reqSocket = this._socketFor(requester);
 
     const respond = (accept, reason) => {
@@ -5885,7 +6439,8 @@ class SocketHandlers {
       requester.playerIndex !== pending.requesterSeat ||
       target.playerIndex !== pending.targetSeat ||
       room.hostPlayerId === requester.playerId ||
-      room.hostPlayerId === target.playerId
+      room.hostPlayerId === target.playerId ||
+      requester.playerIndex === 0 || target.playerIndex === 0
     ) {
       respond(false, 'seat_taken');
       this._swapFail(socket, 'seat_taken', 'That seat just changed');
@@ -5912,6 +6467,7 @@ class SocketHandlers {
     if (!requesterId) return;
     const room = this.gameService.getPlayerRoom(requesterId);
     if (!room) return;
+    if (!this._socketOwnsSeat(socket, room.getPlayer(requesterId))) return;
 
     const pend = this._roomPending(room);
     let targetPlayerId = data.targetPlayerId != null ? String(data.targetPlayerId) : null;
@@ -6079,7 +6635,7 @@ class SocketHandlers {
     if (!room) return this._swapFail(socket, 'not_allowed', 'Room not found');
 
     const inviter = room.getPlayer(inviterId);
-    if (!inviter) return this._swapFail(socket, 'not_allowed');
+    if (!this._socketOwnsSeat(socket, inviter)) return this._swapFail(socket, 'not_allowed');
     if (this._seatsLocked(room)) {
       return this._swapFail(socket, 'not_allowed', 'Game already started');
     }
@@ -6090,7 +6646,7 @@ class SocketHandlers {
     }
     // The host seat is fixed and can never be the invite target.
     const occupant = room.getPlayers().find((p) => p.playerIndex === seat);
-    if (occupant && occupant.playerId === room.hostPlayerId) {
+    if (seat === 0 || (occupant && occupant.playerId === room.hostPlayerId)) {
       return this._swapFail(socket, 'seat_taken', 'The host seat can\'t be taken', seat);
     }
     if (occupant) {
@@ -6153,6 +6709,8 @@ class SocketHandlers {
     const pending = invites.get(spectatorId);
     // Idempotent: no pending → stale/duplicate/expired answer, ignore.
     if (!pending) return;
+    if ((data.inviterId != null && String(data.inviterId) !== String(pending.inviterId)) ||
+        (data.seat != null && Number(data.seat) !== pending.seat)) return;
     invites.delete(spectatorId);
     clearTimeout(pending.timeout);
 
@@ -6182,6 +6740,7 @@ class SocketHandlers {
     // the host is already covered by `occupant`.
     const seatTaken =
       this._seatsLocked(room) ||
+      seat === 0 ||
       !!occupant ||
       (!!occupant && occupant.playerId === room.hostPlayerId);
     if (seatTaken) {
@@ -6227,6 +6786,7 @@ class SocketHandlers {
     if (!inviterId) return;
     const room = this.gameService.getPlayerRoom(inviterId);
     if (!room) return;
+    if (!this._socketOwnsSeat(socket, room.getPlayer(inviterId))) return;
 
     const invites = this._roomInvites(room);
     let spectatorId = data.spectatorId != null ? String(data.spectatorId) : null;
@@ -6274,6 +6834,7 @@ class SocketHandlers {
     if (!callerId) return this._swapFail(socket, 'not_allowed', 'Host only');
     const room = this.gameService.getPlayerRoom(callerId);
     if (!room) return this._swapFail(socket, 'not_allowed', 'Room not found');
+    if (!this._socketOwnsSeat(socket, room.getPlayer(callerId))) return this._swapFail(socket, 'not_allowed');
     if (room.hostPlayerId !== callerId) {
       return this._swapFail(socket, 'not_allowed', 'Host only');
     }
@@ -6294,15 +6855,27 @@ class SocketHandlers {
     // Re-read live state right before mutating (single-threaded; keep adjacent).
     const playerA = room.getPlayers().find((p) => p.playerIndex === seatA);
     const playerB = room.getPlayers().find((p) => p.playerIndex === seatB);
+    for (const [key, player] of [['expectedPlayerAId', playerA], ['expectedPlayerBId', playerB]]) {
+      if (!Object.prototype.hasOwnProperty.call(data, key)) continue;
+      const expected = data[key] == null ? null : String(data[key]);
+      const actual = player ? String(player.playerId) : null;
+      if (expected !== actual) return this._swapFail(socket, 'seat_taken', 'That seat just changed');
+    }
 
     // The host seat is fixed — neither end may be the host's own seat.
     if (
+      seatA === 0 || seatB === 0 ||
       (playerA && playerA.playerId === room.hostPlayerId) ||
       (playerB && playerB.playerId === room.hostPlayerId)
     ) {
       return this._swapFail(socket, 'host_seat', 'The host seat can\'t be moved');
     }
     if (!playerA && !playerB) return; // nothing to move
+    for (const player of [playerA, playerB]) {
+      if (player) this._clearPendingFor(room, player.playerId);
+    }
+    this._clearInvitesForSeat(room, seatA);
+    this._clearInvitesForSeat(room, seatB);
 
     if (playerA && playerB) {
       playerA.playerIndex = seatB;
@@ -6327,7 +6900,8 @@ class SocketHandlers {
    * state as a viewer.
    * @param {Socket} socket
    */
-  handleLeaveSeat(socket) {
+  handleLeaveSeat(socket, { preserveJoinIntent = false } = {}) {
+    if (!preserveJoinIntent) socket._roomJoinEpoch = (socket._roomJoinEpoch || 0) + 1;
     const playerId = this.gameService.getPlayerIdBySocket(socket.id);
     if (!playerId) {
       const spectatorRoomId = this.spectatorSocketToRoom.get(socket.id);
@@ -6351,7 +6925,7 @@ class SocketHandlers {
 
     // Re-read live state right before mutating (single-threaded; keep adjacent).
     const player = room.getPlayer(playerId);
-    if (!player) return;
+    if (!this._socketOwnsSeat(socket, player)) return;
     if (playerId === room.hostPlayerId) {
       return this._swapFail(socket, 'host_seat', 'The host can\'t leave their seat');
     }
@@ -6395,6 +6969,7 @@ class SocketHandlers {
     const caller = this.gameService.getPlayerIdBySocket(socket.id);
     const room = this.gameService.getPlayerRoom(caller);
     if (!room) return this._swapFail(socket, 'not_allowed', 'Host only');
+    if (!this._socketOwnsSeat(socket, room.getPlayer(caller))) return this._swapFail(socket, 'not_allowed', 'Host only');
     if (room.hostPlayerId !== caller) {
       return this._swapFail(socket, 'not_allowed', 'Host only');
     }
