@@ -113,11 +113,15 @@ class ActionHandlers {
     const savedDiscardLock = room.discardLocks.get(playerId) || null;
     const prevMust = (room.mustMeldCard && resolvedCards.some((c) => this._sameCard(c, room.mustMeldCard) || (c.suit === room.mustMeldCard.suit && c.rank === room.mustMeldCard.rank)))
       ? { ...room.mustMeldCard } : null;
-    room.drawnCardThisTurnRestriction = new Set();
+    // RULE CHANGE (2026-09-21, owner): a meld pays off NOTHING. The just-taken
+    // card keeps its per-turn restriction and the anti ping-pong lock (taken
+    // card + twins) keeps its countdown. It used to be "meld anything and every
+    // blocked card is yours to throw" (`drawnCardThisTurnRestriction = new
+    // Set()` + `discardLocks.delete(playerId)` here); now only nextTurn(), a
+    // deck draw, a multi-card take or a new deal release them. Mirrored by the
+    // Flutter GameController.playMeld. The snapshot above still round-trips
+    // both so an UNDO restores exactly what the meld saw.
     room.meldedThisTurn = true;
-    // A meld is the price of the anti ping-pong lock: pay it and the card is
-    // yours to throw. Snapshotted above so an UNDO puts the lock back.
-    room.discardLocks.delete(playerId);
     room.lastMeldSnapshot = {
       playerId,
       wasNewMeld: true,
@@ -366,11 +370,10 @@ class ActionHandlers {
     this._recomputeTurnMeldPoints(room, playerId);
 
     // Going down lays multiple melds at once; undo of the batch is not supported.
-    room.drawnCardThisTurnRestriction = new Set();
+    // RULE CHANGE (2026-09-21, owner): going down pays off nothing either — the
+    // per-turn restriction and the anti ping-pong lock both survive it (see
+    // handlePlayMeld).
     room.meldedThisTurn = true;
-    // A meld is the price of the anti ping-pong lock — including this one. Miss
-    // it here and a lock survives a perfectly legal go-down.
-    room.discardLocks.delete(playerId);
     room.lastMeldSnapshot = null;
 
     // Clear mustMeldCard if any laid meld includes it.
@@ -503,11 +506,10 @@ class ActionHandlers {
     const wasMeldedBefore = room.meldedThisTurn || false;
     const savedRestriction = new Set(room.drawnCardThisTurnRestriction);
     const savedDiscardLock = room.discardLocks.get(playerId) || null;
-    room.drawnCardThisTurnRestriction = new Set();
+    // RULE CHANGE (2026-09-21, owner): an add-to-meld pays off nothing — the
+    // per-turn restriction and the anti ping-pong lock both survive it (see
+    // handlePlayMeld). The snapshot still round-trips them for UNDO.
     room.meldedThisTurn = true;
-    // A meld is the price of the anti ping-pong lock: pay it and the card is
-    // yours to throw. Snapshotted above so an UNDO puts the lock back.
-    room.discardLocks.delete(playerId);
     const prevMust = (room.mustMeldCard && resolvedCards.some((c) => this._sameCard(c, room.mustMeldCard) || (c.suit === room.mustMeldCard.suit && c.rank === room.mustMeldCard.rank)))
       ? { ...room.mustMeldCard } : null;
     if (prevMust) room.mustMeldCard = null;
@@ -702,9 +704,9 @@ class ActionHandlers {
     if (snap.restoredMustMeldCard) room.mustMeldCard = snap.restoredMustMeldCard;
     room.meldedThisTurn = snap.wasMeldedBefore || false;
     room.drawnCardThisTurnRestriction = new Set(snap.savedRestriction);
-    // Undoing the meld un-pays the anti ping-pong lock. Without this the player
-    // walks away unlocked while their client still shows the lock — client and
-    // server then disagree about a legal discard, which is a hung turn.
+    // A meld no longer touches the anti ping-pong lock (2026-09-21), so this
+    // restore is a no-op in practice; kept so an undo always lands on exactly
+    // the state the meld was made from.
     if (snap.savedDiscardLock) room.discardLocks.set(playerId, snap.savedDiscardLock);
     else room.discardLocks.delete(playerId);
     room.lastMeldSnapshot = null;

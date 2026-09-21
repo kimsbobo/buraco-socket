@@ -8764,8 +8764,8 @@ class SocketHandlers {
         // the very next deck draw or multi-card take releases it.
         if (normalizedPicked.length === 1) {
           // RULE A, per-turn half: the card the pile was taken FOR cannot go
-          // straight back this turn. A meld lifts it (meldedThisTurn) and
-          // nextTurn() wipes the set, so this is "meld it or keep it this turn".
+          // straight back this turn. Only nextTurn() wipes the set — a meld no
+          // longer lifts it (2026-09-21) — so this is "keep it this turn".
           // Keyed by cardId, falling back to suit-rank only for an id-less card.
           room.drawnCardThisTurnRestriction.add(
             String(topCard.cardId ?? `${topCard.suit}-${topCard.rank}`)

@@ -1266,7 +1266,10 @@ class BotStrategy {
     const closing = hand.length === 1;
 
     const legal = hand.filter((card) => {
-      const restricted = this._restrictionMatches(restrictions, card) && !state.meldedThisTurn;
+      // A meld no longer lifts the just-taken restriction (2026-09-21), so
+      // `state.meldedThisTurn` is deliberately not consulted here — mirror of
+      // GameValidator.validateDiscard.
+      const restricted = this._restrictionMatches(restrictions, card);
       // The server SHORT-CIRCUITS a restricted card at hand size 1 as valid,
       // bypassing the close requirements entirely — mirror that exactly.
       if (restricted) return hand.length === 1;
@@ -1437,9 +1440,7 @@ class BotStrategy {
     const held = (c) => lockedIds.includes(String(c?.cardId ?? c?.instanceId ?? c?.id));
     if (!held(card)) return false;
     const restrictions = new Set(state.drawnCardRestriction || []);
-    return (hand || []).some(
-      (c) => !held(c) && !(this._restrictionMatches(restrictions, c) && !state.meldedThisTurn)
-    );
+    return (hand || []).some((c) => !held(c) && !this._restrictionMatches(restrictions, c));
   }
 
   _restrictionMatches(restrictions, card) {

@@ -226,12 +226,13 @@ class GameValidator {
 
     // House rule (matches the client GameController.canDiscardReason): the card
     // the player took the pile FOR cannot be thrown straight back this turn —
-    // discard a DIFFERENT card, or meld first. RULE A (2026-09-02): this fires
-    // on a take of EXACTLY ONE card only. A take of two or more restricts
-    // nothing (RULE B) and a deck draw restricts nothing (RULE C); the
-    // 2026-09-01 "any take size" revision is reverted. The classic "meld the
-    // taken card first" (mustMeldCard) block stays REMOVED.
-    if (this._restrictionMatches(room.drawnCardThisTurnRestriction, card) && !room.meldedThisTurn) {
+    // discard a DIFFERENT card. RULE CHANGE (2026-09-21, owner): a meld does
+    // NOT lift this any more (`&& !room.meldedThisTurn` used to sit here); only
+    // nextTurn() does. RULE A (2026-09-02): this fires on a take of EXACTLY ONE
+    // card only. A take of two or more restricts nothing (RULE B) and a deck
+    // draw restricts nothing (RULE C). The classic "meld the taken card first"
+    // (mustMeldCard) block stays REMOVED.
+    if (this._restrictionMatches(room.drawnCardThisTurnRestriction, card)) {
       if (handSize === 1) {
         // Only card — no legal meld possible; lift restriction to avoid stuck state.
         return { isValid: true };
@@ -246,7 +247,7 @@ class GameValidator {
     if (this._pingPongBlocks(room, playerId, card, playerHand)) {
       return {
         isValid: false,
-        error: 'You took the pile for that card — meld before throwing it back',
+        error: 'You took the pile for that card — it cannot go back on the pile yet',
         reason: 'pingPongLocked',
       };
     }
@@ -590,7 +591,8 @@ class GameValidator {
    * RULE A (2026-09-02) does put a twin under the lock, but as an ID added at
    * ARM time by SocketHandlers.handlePickUpPile — only the copies that were
    * already in hand when a LONE card was taken, and only until the next deck
-   * draw or multi-card take releases the lock. That is deliberately narrower
+   * draw or multi-card take releases the lock (a MELD does not, since
+   * 2026-09-21). That is deliberately narrower
    * than the old rank+suit key, which froze the family on every take, forever,
    * including copies that arrived from the stock afterwards.
    *
@@ -627,9 +629,7 @@ class GameValidator {
     // "a card I could throw instead", and a hand of nothing but the two would
     // refuse both discards: a wedged turn.
     return (hand || []).some(
-      (c) =>
-        !held(c) &&
-        !(this._restrictionMatches(room.drawnCardThisTurnRestriction, c) && !room.meldedThisTurn)
+      (c) => !held(c) && !this._restrictionMatches(room.drawnCardThisTurnRestriction, c)
     );
   }
 

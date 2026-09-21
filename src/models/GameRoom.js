@@ -937,8 +937,9 @@ class GameRoom {
   }
 
   /**
-   * ANTI PING-PONG: release `playerId`'s ACTIVE lock. A meld, a deck draw, a
-   * multi-card take and a new deal all pay one off early.
+   * ANTI PING-PONG: release `playerId`'s ACTIVE lock. A deck draw, a multi-card
+   * take and a new deal pay one off early. A MELD does NOT (owner rule change
+   * 2026-09-21): ActionHandlers no longer calls this from any meld path.
    *
    * The seat's take HISTORY is deliberately left standing: releasing it here
    * would reopen the two-copy volley the moment the taker drew a card, which is
